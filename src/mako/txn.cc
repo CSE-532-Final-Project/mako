@@ -65,3 +65,35 @@ event_counter transaction_base::g_evt_dbtuple_write_insert_failed
 event_counter transaction_base::evt_local_search_lookups("local_search_lookups");
 event_counter transaction_base::evt_local_search_write_set_hits("local_search_write_set_hits");
 event_counter transaction_base::evt_dbtuple_latest_replacement("dbtuple_latest_replacement");
+
+#if ENABLE_EARLY_LOCK_VIOLATION && defined(CHECK_INVARIANTS)
+namespace {
+struct dependency_dummy_txn : public transaction_base {
+  dependency_dummy_txn(uint64_t f = 0) : transaction_base(f) {}
+  void request_abort_from_dependency(transaction_base *) override
+  {
+    state = TXN_ABRT;
+  }
+};
+
+void run_dependency_sanity_checks()
+{
+  dependency_dummy_txn upstream(transaction_base::TXN_FLAG_EARLY_LOCK_VIOLATION);
+  dependency_dummy_txn dependent(transaction_base::TXN_FLAG_EARLY_LOCK_VIOLATION);
+  ALWAYS_ASSERT(dependent.add_dependency_on(&upstream));
+  ALWAYS_ASSERT(dependent.dependency_waiting());
+  upstream.notify_dependents_commit();
+  ALWAYS_ASSERT(!dependent.dependency_waiting());
+  dependency_dummy_txn upstream_abort(transaction_base::TXN_FLAG_EARLY_LOCK_VIOLATION);
+  dependency_dummy_txn dependent_abort(transaction_base::TXN_FLAG_EARLY_LOCK_VIOLATION);
+  dependent_abort.add_dependency_on(&upstream_abort);
+  upstream_abort.notify_dependents_abort();
+  ALWAYS_ASSERT(dependent_abort.dependency_canceled());
+  ALWAYS_ASSERT(dependent_abort.state == transaction_base::TXN_ABRT);
+}
+
+struct dependency_test_hook {
+  dependency_test_hook() { run_dependency_sanity_checks(); }
+} g_dependency_test_hook;
+} // anonymous namespace
+#endif

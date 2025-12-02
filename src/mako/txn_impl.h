@@ -42,6 +42,7 @@ transaction<Protocol, Traits>::clear()
   // read/write/absent sets, and let the destructors do the clearing- this is
   // because the destructors can take shortcuts since it knows the obj doesn't
   // have to end in a valid state
+  this->clear_dependencies();
 }
 
 template <template <typename> class Protocol, typename Traits>
@@ -60,6 +61,7 @@ transaction<Protocol, Traits>::abort_impl(abort_reason reason)
   }
   state = TXN_ABRT;
   this->reason = reason;
+  this->notify_dependents_abort();
 
   // on abort, we need to go over all insert nodes and
   // release the locks
@@ -133,6 +135,12 @@ namespace {
         oss << " | TXN_FLAG_READ_ONLY";
       first = false;
     }
+    if (flags & transaction_base::TXN_FLAG_EARLY_LOCK_VIOLATION) {
+      if (first)
+        oss << "TXN_FLAG_EARLY_LOCK_VIOLATION";
+      else
+        oss << " | TXN_FLAG_EARLY_LOCK_VIOLATION";
+    }
     return oss.str();
   }
 }
@@ -145,6 +153,8 @@ transaction<Protocol, Traits>::dump_debug_info() const
        << transaction_state_to_cstr(state) << std::endl;
   std::cerr << "  Abort Reason: " << AbortReasonStr(reason) << std::endl;
   std::cerr << "  Flags: " << transaction_flags_to_str(flags) << std::endl;
+  std::cerr << "  Dependencies: in=" << in_dep_.load(std::memory_order_acquire)
+            << " out=" << out_deps_.size() << std::endl;
   std::cerr << "  Read/Write sets:" << std::endl;
 
   std::cerr << "      === Read Set ===" << std::endl;
@@ -193,7 +203,8 @@ template <template <typename> class Protocol, typename Traits>
 bool
 transaction<Protocol, Traits>::handle_last_tuple_in_group(
     dbtuple_write_info &last,
-    bool did_group_insert)
+    bool did_group_insert,
+    bool allow_violation)
 {
   if (did_group_insert) {
     // don't need to lock
@@ -205,24 +216,50 @@ transaction<Protocol, Traits>::handle_last_tuple_in_group(
   } else {
     dbtuple *tuple = last.get_tuple();
     if (unlikely(tuple->version == dbtuple::MAX_TID)) {
-      // if we race to put/insert w/ another txn which has inserted a new
-      // record, we *must* abort b/c the other txn could try to put/insert
-      // into a new record which we hold the lock on, so we must abort
-      //
-      // other ideas:
-      // we could *not* abort if this txn did not insert any new records.
-      // we could also release our insert locks and try to acquire them
-      // again in sorted order
+      if (allow_violation) {
+        transaction_base *owner = tuple->lock_owner_txn();
+        if (owner && owner != this) {
+          last.mark_violation();
+          last.entry->set_do_write();
+          return add_dependency_on(owner);
+        }
+      }
       return false; // signal abort
     }
-    const dbtuple::version_t v = tuple->lock(true); // lock for write
+    dbtuple::version_t v = 0;
+    bool locked = false;
+    if (allow_violation) {
+      locked = tuple->try_lock(true, v);
+      if (!locked) {
+        transaction_base *owner = tuple->lock_owner_txn();
+        if (owner && owner != this) {
+          last.mark_violation();
+          last.entry->set_do_write();
+          return add_dependency_on(owner);
+        }
+        return false;
+      }
+    } else {
+      v = tuple->lock(true); // lock for write
+      locked = true;
+    }
+    INVARIANT(locked);
     INVARIANT(dbtuple::IsLatest(v) == tuple->is_latest());
-    last.mark_locked();
+    tuple->set_lock_owner_txn(this);
     if (unlikely(!dbtuple::IsLatest(v) ||
                  !cast()->can_read_tid(tuple->version))) {
-      // XXX(stephentu): overly conservative (with the can_read_tid() check)
+      tuple->unlock();
+      if (allow_violation) {
+        transaction_base *owner = tuple->lock_owner_txn();
+        if (owner && owner != this) {
+          last.mark_violation();
+          last.entry->set_do_write();
+          return add_dependency_on(owner);
+        }
+      }
       return false; // signal abort
     }
+    last.mark_locked();
     last.entry->set_do_write();
   }
   return true;
@@ -255,6 +292,15 @@ transaction<Protocol, Traits>::commit(bool doThrow)
 
   dbtuple_write_info_vec write_dbtuples;
   std::pair<bool, tid_t> commit_tid(false, 0);
+  const bool allow_lock_violation =
+    early_lock_violation_enabled() && !is_snapshot();
+  bool has_lock_violation = false;
+  bool needs_revalidate = false;
+
+  if (allow_lock_violation && dependency_canceled()) {
+    reason = ABORT_REASON_DEPENDENCY_CHAIN;
+    goto do_abort;
+  }
 
   // copy write tuples to vector for sorting
   if (!write_set.empty()) {
@@ -299,7 +345,7 @@ transaction<Protocol, Traits>::commit(bool doThrow)
       for (; it != it_end; last_px = &(*it), ++it) {
         if (likely(last_px && last_px->tuple != it->tuple)) {
           // on boundary
-          if (unlikely(!handle_last_tuple_in_group(*last_px, inserted_last_run))) {
+          if (unlikely(!handle_last_tuple_in_group(*last_px, inserted_last_run, allow_lock_violation))) {
             abort_trap((reason = ABORT_REASON_WRITE_NODE_INTERFERENCE));
             goto do_abort;
           }
@@ -317,17 +363,23 @@ transaction<Protocol, Traits>::commit(bool doThrow)
         }
       }
       if (likely(last_px) &&
-          unlikely(!handle_last_tuple_in_group(*last_px, inserted_last_run))) {
+          unlikely(!handle_last_tuple_in_group(*last_px, inserted_last_run, allow_lock_violation))) {
         abort_trap((reason = ABORT_REASON_WRITE_NODE_INTERFERENCE));
         goto do_abort;
       }
-      commit_tid.first = true;
-      PERF_DECL(
-          static std::string probe5_name(
-            std::string(__PRETTY_FUNCTION__) + std::string(":gen_commit_tid:")));
-      ANON_REGION(probe5_name.c_str(), &transaction_base::g_txn_commit_probe5_cg);
-      commit_tid.second = cast()->gen_commit_tid(write_dbtuples);
-      VERBOSE(std::cerr << "commit tid: " << g_proto_version_str(commit_tid.second) << std::endl);
+      if (allow_lock_violation) {
+        for (auto &info : write_dbtuples)
+          has_lock_violation = has_lock_violation || info.violated_lock();
+      }
+      if (!has_lock_violation) {
+        commit_tid.first = true;
+        PERF_DECL(
+            static std::string probe5_name(
+              std::string(__PRETTY_FUNCTION__) + std::string(":gen_commit_tid:")));
+        ANON_REGION(probe5_name.c_str(), &transaction_base::g_txn_commit_probe5_cg);
+        commit_tid.second = cast()->gen_commit_tid(write_dbtuples);
+        VERBOSE(std::cerr << "commit tid: " << g_proto_version_str(commit_tid.second) << std::endl);
+      }
     } else {
       VERBOSE(std::cerr << "commit tid: <read-only>" << std::endl);
     }
@@ -355,6 +407,14 @@ transaction<Protocol, Traits>::commit(bool doThrow)
                 it->get_tuple()->stable_is_latest_version(it->get_tid())))
             continue;
 
+          if (allow_lock_violation) {
+            transaction_base *owner = it->get_tuple()->lock_owner_txn();
+            if (owner && owner != this && add_dependency_on(owner)) {
+              needs_revalidate = true;
+              continue;
+            }
+          }
+
           VERBOSE(std::cerr << "validating dbtuple " << util::hexify(it->get_tuple()) << " at snapshot_tid "
                             << g_proto_version_str(cast()->snapshot_tid()) << " FAILED" << std::endl
                             << "  txn read version: " << g_proto_version_str(it->get_tid()) << std::endl
@@ -380,6 +440,66 @@ transaction<Protocol, Traits>::commit(bool doThrow)
             goto do_abort;
           }
         }
+      }
+    }
+
+    if (allow_lock_violation) {
+      if (dependency_canceled()) {
+        abort_trap((reason = ABORT_REASON_DEPENDENCY_CHAIN));
+        goto do_abort;
+      }
+      while (dependency_waiting()) {
+        if (dependency_canceled()) {
+          abort_trap((reason = ABORT_REASON_DEPENDENCY_CHAIN));
+          goto do_abort;
+        }
+        nop_pause();
+      }
+
+      if (has_lock_violation) {
+        typename dbtuple_write_info_vec::iterator it     = write_dbtuples.begin();
+        typename dbtuple_write_info_vec::iterator it_end = write_dbtuples.end();
+        for (; it != it_end; ++it) {
+          if (it->is_insert() || it->is_locked())
+            continue;
+          dbtuple *tuple = it->get_tuple();
+          const dbtuple::version_t v = tuple->lock(true);
+          tuple->set_lock_owner_txn(this);
+          if (unlikely(!dbtuple::IsLatest(v) ||
+                       !cast()->can_read_tid(tuple->version))) {
+            abort_trap((reason = ABORT_REASON_WRITE_NODE_INTERFERENCE));
+            goto do_abort;
+          }
+          it->mark_locked();
+          it->entry->set_do_write();
+        }
+        has_lock_violation = false;
+      }
+
+      if (!commit_tid.first && !write_dbtuples.empty()) {
+        commit_tid.first = true;
+        PERF_DECL(
+            static std::string probe5_name(
+              std::string(__PRETTY_FUNCTION__) + std::string(":gen_commit_tid:")));
+        ANON_REGION(probe5_name.c_str(), &transaction_base::g_txn_commit_probe5_cg);
+        commit_tid.second = cast()->gen_commit_tid(write_dbtuples);
+        VERBOSE(std::cerr << "commit tid: " << g_proto_version_str(commit_tid.second) << std::endl);
+      }
+
+      if (needs_revalidate && !read_set.empty()) {
+        typename read_set_map::iterator it     = read_set.begin();
+        typename read_set_map::iterator it_end = read_set.end();
+        for (; it != it_end; ++it) {
+          const bool found = sorted_dbtuples_contains(
+              write_dbtuples, it->get_tuple());
+          if (likely(found ?
+                it->get_tuple()->is_latest_version(it->get_tid()) :
+                it->get_tuple()->stable_is_latest_version(it->get_tid())))
+            continue;
+          abort_trap((reason = ABORT_REASON_READ_NODE_INTEREFERENCE));
+          goto do_abort;
+        }
+        needs_revalidate = false;
       }
     }
 
@@ -415,6 +535,7 @@ transaction<Protocol, Traits>::commit(bool doThrow)
             INVARIANT(ret.rest_ == tuple);
             // XXX: write_record_at() should acquire this lock
             ret.head_->lock(true);
+            ret.head_->set_lock_owner_txn(this);
             unlock_head = true;
             // need to unlink tuple from underlying btree, replacing
             // with ret.rest_ (atomically)
@@ -450,6 +571,7 @@ transaction<Protocol, Traits>::commit(bool doThrow)
       }
     }
   }
+  this->notify_dependents_commit();
   state = TXN_COMMITED;
   if (commit_tid.first)
     cast()->on_tid_finish(commit_tid.second);
@@ -462,6 +584,8 @@ do_abort:
     VERBOSE(std::cerr << "aborting txn @ snapshot_tid " << cast()->snapshot_tid() << std::endl);
   else
     VERBOSE(std::cerr << "aborting txn" << std::endl);
+
+  this->notify_dependents_abort();
 
   for (typename dbtuple_write_info_vec::iterator it = write_dbtuples.begin();
        it != write_dbtuples.end(); ++it) {
@@ -510,6 +634,7 @@ transaction<Protocol, Traits>::try_insert_new_tuple(
 
   // perf: ~900 tsc/alloc on istc11.csail.mit.edu
   dbtuple * const tuple = dbtuple::alloc_first(sz, true);
+  tuple->set_lock_owner_txn(this);
   if (value)
     writer(dbtuple::TUPLE_WRITER_DO_WRITE,
         value, tuple->get_value_start(), 0);

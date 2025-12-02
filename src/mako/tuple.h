@@ -29,6 +29,8 @@
 template <template <typename> class Protocol, typename Traits>
   class transaction; // forward decl
 
+class transaction_base; // forward decl
+
 // XXX: hack
 extern std::string (*g_proto_version_str)(uint64_t v);
 
@@ -130,6 +132,9 @@ public:
   std::thread::id lock_owner;
 #endif
 
+  // Current transaction owning the lock, if any.
+  std::atomic<transaction_base *> lock_owner_txn_;
+
   // uninterpreted TID
   tid_t version;
 
@@ -186,6 +191,7 @@ private:
 #ifdef TUPLE_LOCK_OWNERSHIP_CHECKING
       , lock_owner()
 #endif
+      , lock_owner_txn_(nullptr)
       , version(MAX_TID)
       , size(CheckBounds(size))
       , alloc_size(CheckBounds(alloc_size))
@@ -228,6 +234,7 @@ private:
 #ifdef TUPLE_LOCK_OWNERSHIP_CHECKING
       , lock_owner()
 #endif
+      , lock_owner_txn_(nullptr)
       , version(version)
       , size(base->size)
       , alloc_size(CheckBounds(alloc_size))
@@ -268,6 +275,7 @@ private:
 #ifdef TUPLE_LOCK_OWNERSHIP_CHECKING
       , lock_owner()
 #endif
+      , lock_owner_txn_(nullptr)
       , version(version)
       , size(CheckBounds(new_size))
       , alloc_size(CheckBounds(alloc_size))
@@ -320,6 +328,24 @@ public:
   is_locked() const
   {
     return IsLocked(hdr);
+  }
+
+  inline transaction_base *
+  lock_owner_txn() const
+  {
+    return lock_owner_txn_.load(std::memory_order_acquire);
+  }
+
+  inline void
+  set_lock_owner_txn(transaction_base *owner)
+  {
+    lock_owner_txn_.store(owner, std::memory_order_release);
+  }
+
+  inline void
+  clear_lock_owner_txn()
+  {
+    lock_owner_txn_.store(nullptr, std::memory_order_release);
   }
 
   static inline bool
@@ -378,6 +404,35 @@ public:
     return hdr;
   }
 
+  inline bool
+  // @unsafe - attempts to acquire tuple lock once, returning false if it is already held
+  try_lock(bool write_intent, version_t &out_v)
+  {
+    CheckMagic();
+    out_v = hdr;
+    const version_t lockmask = write_intent ?
+      (HDR_LOCKED_MASK | HDR_WRITE_INTENT_MASK) :
+      (HDR_LOCKED_MASK);
+    while (true) {
+      if (IsLocked(out_v))
+        return false;
+      if (__sync_bool_compare_and_swap(&hdr, out_v, out_v | lockmask))
+        break;
+      nop_pause();
+      out_v = hdr;
+    }
+#ifdef TUPLE_LOCK_OWNERSHIP_CHECKING
+    lock_owner = std::this_thread::get_id();
+    AddTupleToLockRegion(this);
+    INVARIANT(is_lock_owner());
+#endif
+    COMPILER_MEMORY_FENCE;
+    INVARIANT(IsLocked(hdr));
+    INVARIANT(!write_intent || IsWriteIntent(hdr));
+    INVARIANT(!IsModifying(hdr));
+    return true;
+  }
+
   inline void
   // @unsafe - clears lock/write bits and bumps version using manual bit fiddling
   unlock()
@@ -406,6 +461,7 @@ public:
     lock_owner = std::thread::id();
     INVARIANT(!is_lock_owner());
 #endif
+    clear_lock_owner_txn();
     COMPILER_MEMORY_FENCE;
     hdr = v;
   }

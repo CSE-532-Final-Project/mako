@@ -18,6 +18,12 @@
 #include <iomanip>
 #include <random>
 
+// Early lock violation (DLV-style) is opt-in. Set to 1 to allow the runtime
+// TXN_FLAG_EARLY_LOCK_VIOLATION flag to take effect.
+#ifndef ENABLE_EARLY_LOCK_VIOLATION
+#define ENABLE_EARLY_LOCK_VIOLATION 1
+#endif
+
 // promise.timeout is abandoned
 #define GET_TIMEOUT 250
 #define ABORT_TIMEOUT 250

@@ -15,6 +15,12 @@
 #include <limits>
 #include <type_traits>
 #include <tuple>
+#include <atomic>
+#include <mutex>
+
+#ifndef ENABLE_EARLY_LOCK_VIOLATION
+#define ENABLE_EARLY_LOCK_VIOLATION 1
+#endif
 
 #include <unordered_map>
 
@@ -71,6 +77,7 @@ public:
     TXN_FLAG_READ_ONLY = 0x2,
 
     // XXX: more flags in the future, things like consistency levels
+    TXN_FLAG_EARLY_LOCK_VIOLATION = 0x4,
   };
 
 #define ABORT_REASONS(x) \
@@ -83,7 +90,8 @@ public:
     x(ABORT_REASON_WRITE_NODE_INTERFERENCE) \
     x(ABORT_REASON_INSERT_NODE_INTERFERENCE) \
     x(ABORT_REASON_READ_NODE_INTEREFERENCE) \
-    x(ABORT_REASON_READ_ABSENCE_INTEREFERENCE)
+    x(ABORT_REASON_READ_ABSENCE_INTEREFERENCE) \
+    x(ABORT_REASON_DEPENDENCY_CHAIN)
 
   enum abort_reason {
 #define ENUM_X(x) x,
@@ -108,7 +116,11 @@ public:
   transaction_base(uint64_t flags)
     : state(TXN_EMBRYO),
       reason(ABORT_REASON_NONE),
-      flags(flags) {}
+      flags(flags),
+      in_dep_(0)
+  {}
+
+  virtual ~transaction_base() {}
 
   transaction_base(const transaction_base &) = delete;
   transaction_base(transaction_base &&) = delete;
@@ -150,6 +162,59 @@ public:
   {
     return flags;
   }
+
+  inline bool
+  early_lock_violation_enabled() const
+  {
+#if ENABLE_EARLY_LOCK_VIOLATION
+    return flags & TXN_FLAG_EARLY_LOCK_VIOLATION;
+#else
+    return false;
+#endif
+  }
+
+  inline bool
+  add_dependency_on(transaction_base *other)
+  {
+    if (unlikely(!other) || other == this)
+      return false;
+    {
+      std::lock_guard<std::mutex> lg(other->dep_mutex_);
+      other->out_deps_.push_back(this);
+    }
+    in_dep_.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+  }
+
+  inline void
+  on_upstream_commit(transaction_base *)
+  {
+    in_dep_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  inline void
+  on_upstream_abort(transaction_base *)
+  {
+    in_dep_.store(-1, std::memory_order_release);
+  }
+
+  inline bool
+  dependency_waiting() const
+  {
+    return in_dep_.load(std::memory_order_acquire) > 0;
+  }
+
+  inline bool
+  dependency_canceled() const
+  {
+    return in_dep_.load(std::memory_order_acquire) < 0;
+  }
+
+  void notify_dependents_commit();
+  void notify_dependents_abort();
+  void clear_dependencies();
+
+  virtual void request_abort_from_dependency(transaction_base *) {}
 
 protected:
 
@@ -271,6 +336,7 @@ protected:
     enum {
       FLAGS_LOCKED = 0x1,
       FLAGS_INSERT = 0x1 << 1,
+      FLAGS_LOCK_VIOLATION = 0x1 << 2,
     };
     dbtuple_write_info() : tuple(), entry(nullptr), pos() {}
     dbtuple_write_info(dbtuple *tuple, write_record_t *entry,
@@ -310,6 +376,16 @@ protected:
     {
       return tuple.get_flags() & FLAGS_INSERT;
     }
+    inline ALWAYS_INLINE bool
+    violated_lock() const
+    {
+      return tuple.get_flags() & FLAGS_LOCK_VIOLATION;
+    }
+    inline ALWAYS_INLINE void
+    mark_violation()
+    {
+      tuple.or_flags(FLAGS_LOCK_VIOLATION);
+    }
     inline ALWAYS_INLINE
     bool operator<(const dbtuple_write_info &o) const
     {
@@ -344,6 +420,9 @@ protected:
   txn_state state;
   abort_reason reason;
   const uint64_t flags;
+  std::atomic<int32_t> in_dep_;
+  std::vector<transaction_base *> out_deps_;
+  mutable std::mutex dep_mutex_;
 };
 
 
@@ -382,6 +461,44 @@ operator<<(std::ostream &o, const transaction_base::absent_record_t &r)
 {
   o << "[v=" << r.version << "]";
   return o;
+}
+
+inline void
+transaction_base::notify_dependents_commit()
+{
+  std::vector<transaction_base *> deps;
+  {
+    std::lock_guard<std::mutex> lg(dep_mutex_);
+    deps.swap(out_deps_);
+  }
+  for (auto *txn : deps) {
+    if (txn)
+      txn->on_upstream_commit(this);
+  }
+}
+
+inline void
+transaction_base::notify_dependents_abort()
+{
+  std::vector<transaction_base *> deps;
+  {
+    std::lock_guard<std::mutex> lg(dep_mutex_);
+    deps.swap(out_deps_);
+  }
+  for (auto *txn : deps) {
+    if (!txn)
+      continue;
+    txn->on_upstream_abort(this);
+    txn->request_abort_from_dependency(this);
+  }
+}
+
+inline void
+transaction_base::clear_dependencies()
+{
+  in_dep_.store(0, std::memory_order_release);
+  std::lock_guard<std::mutex> lg(dep_mutex_);
+  out_deps_.clear();
 }
 
 struct default_transaction_traits {
@@ -645,6 +762,12 @@ public:
     return get_flags() & TXN_FLAG_READ_ONLY;
   }
 
+  void request_abort_from_dependency(transaction_base *) override
+  {
+    if (state == TXN_ACTIVE)
+      abort_impl(ABORT_REASON_DEPENDENCY_CHAIN);
+  }
+
   // for debugging purposes only
   inline const read_set_map &
   get_read_set() const
@@ -800,7 +923,8 @@ protected:
 
   inline bool
   handle_last_tuple_in_group(
-      dbtuple_write_info &info, bool did_group_insert);
+      dbtuple_write_info &info, bool did_group_insert,
+      bool allow_violation);
 
   read_set_map read_set;
   write_set_map write_set;
