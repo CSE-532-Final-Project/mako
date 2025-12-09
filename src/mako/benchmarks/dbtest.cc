@@ -27,12 +27,13 @@ static void parse_command_line_args(int argc,
       {"cpu-limit"                  , required_argument , 0                          , 'C'} ,
       {"throttle-cycle"             , required_argument , 0                          , 'Y'} ,
       {"sync-dir"                   , required_argument , 0                          , 'S'} ,
+      {"enable_elv"                 , no_argument       , 0                          , 'E'} ,
       {"is-micro"                   , no_argument       , &is_micro                  ,   1} ,
       {"is-replicated"              , no_argument       , &is_replicated             ,   1} ,
       {0, 0, 0, 0}
     };
     int option_index = 0;
-    int c = getopt_long(argc, argv, "t:g:q:F:P:N:L:C:Y:S:", long_options, &option_index);
+    int c = getopt_long(argc, argv, "t:g:q:F:P:N:L:C:Y:S:E", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -100,6 +101,12 @@ static void parse_command_line_args(int argc,
     case 'S': {
       auto& config = BenchmarkConfig::getInstance();
       config.setNfsSyncDir(string(optarg));
+      }
+      break;
+
+    case 'E': {
+      auto& config = BenchmarkConfig::getInstance();
+      config.setEnableElv(1);
       }
       break;
 
@@ -309,6 +316,7 @@ main(int argc, char **argv)
   benchConfig.setIsMicro(is_micro);
   benchConfig.setIsReplicated(is_replicated);
   benchConfig.setPaxosConfigFile(paxos_config_file);
+  set_elv_enabled(benchConfig.getEnableElv());
 
   // Parse local shards if specified
   if (!local_shards_str.empty() && benchConfig.getConfig() != nullptr) {

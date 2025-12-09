@@ -19,6 +19,7 @@
 #include "allocator.h"
 #include "stats_server.h"
 #include "util.h"
+#include "elv.h"
 
 #include "benchmarks/bench.h"
 #include "benchmarks/sto/sync_util.hh"

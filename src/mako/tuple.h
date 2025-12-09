@@ -22,6 +22,7 @@
 #include "small_unordered_map.h"
 #include "prefetch.h"
 #include "ownership_checker.h"
+#include "elv.h"
 
 
 // debugging tool
@@ -470,6 +471,36 @@ public:
   IsModifying(version_t v)
   {
     return v & HDR_MODIFYING_MASK;
+  }
+
+  enum class lock_state_t {
+    UNLOCKED,
+    INTENT_LOCKED,
+    INSTALLING,
+  };
+
+  inline lock_state_t
+  lock_state() const
+  {
+    return LockState(hdr);
+  }
+
+  static inline lock_state_t
+  LockState(version_t v)
+  {
+    if (!IsLocked(v))
+      return lock_state_t::UNLOCKED;
+    if (IsModifying(v))
+      return lock_state_t::INSTALLING;
+    if (IsWriteIntent(v))
+      return lock_state_t::INTENT_LOCKED;
+    return lock_state_t::UNLOCKED;
+  }
+
+  inline bool
+  is_installing() const
+  {
+    return IsLocked(hdr) && IsWriteIntent(hdr) && IsModifying(hdr);
   }
 
   inline bool

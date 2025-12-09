@@ -321,6 +321,20 @@ run_cpu_throttling_scaling() {
     [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]
 }
 
+run_elv_tests() {
+    echo "========================================="
+    echo "Running: ./ci/ci.sh elv"
+    echo "========================================="
+    cleanup_processes
+    pushd build >/dev/null
+    set +e
+    ctest -R ElvTests --output-on-failure
+    local test_result=$?
+    set -e
+    popd >/dev/null
+    return $test_result
+}
+
 cleanup() {
     cleanup_processes
     make clean
@@ -384,6 +398,9 @@ case "${1:-}" in
         ;;
     cpuThrottlingScaling)
         run_cpu_throttling_scaling
+        ;;
+    elv)
+        run_elv_tests
         ;;
     all)
         # Run all steps in sequence

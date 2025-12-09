@@ -1190,7 +1190,7 @@ if(BUILD_TESTS)
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         DEPENDS test_marshal test_rpc test_future test_masstree test_reactor test_rpc_extended test_reactor_extended 
                 test_silo_varint test_silo_rcu_thread test_silo_allocator_tuple 
-                test_sto_transaction test_sto_transaction_real
+                test_sto_transaction test_sto_transaction_real test_elv
                 rpcbench simpleTransaction simplePaxos shard1ReplicationSimple  # test_alock removed
         COMMENT "Running all tests (RRR + Silo/STO)"
     )
@@ -1283,6 +1283,41 @@ if(BUILD_TESTS)
         ${GTEST_INCLUDE_DIRS}
     )
     add_test(NAME SiloAllocatorTupleTests COMMAND test_silo_allocator_tuple)
+
+    # Test: Early Lock Violation behaviors
+    add_executable(test_elv test/test_elv.cc)
+    target_link_libraries(test_elv
+        mako
+        rrr
+        erpc
+        txlog
+        ${GTEST_LIBRARIES}
+        ${GTEST_MAIN_LIBRARIES}
+        pthread
+        yaml-cpp
+        numa
+        event_pthreads
+        rocksdb
+        ${LIBEVENT_LDFLAGS}
+    )
+    target_include_directories(test_elv PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/mako
+        ${GTEST_INCLUDE_DIRS}
+    )
+    # Register individual ELV test cases for clearer CTest output
+    add_test(NAME ElvTests.ReadBypasses
+        COMMAND test_elv --gtest_filter=ElvReadTest.ReadBypassesIntentLockWithStableVersion)
+    add_test(NAME ElvTests.ValidateFails
+        COMMAND test_elv --gtest_filter=ElvValidateTest.ValidationFailsAfterInstall)
+    add_test(NAME ElvTests.WriteConflictSerializes
+        COMMAND test_elv --gtest_filter=ElvWriteTest.WriteWriteConflictsSerializeInstalls)
+    add_test(NAME ElvTests.DisabledBlocks
+        COMMAND test_elv --gtest_filter=ElvReadTest.ElvDisabledBlocksOnIntent)
+    add_test(NAME ElvTests.WaitForInstall
+        COMMAND test_elv --gtest_filter=ElvWriteTest.ReadersWaitForInstallToFinish)
+    add_test(NAME ElvTests.InsertNotBypassed
+        COMMAND test_elv --gtest_filter=ElvInsertTest.InsertMarkerNotBypassed)
 
     # Test: STO Transaction (TRcu)
     add_executable(test_sto_transaction test/test_sto_transaction.cc)

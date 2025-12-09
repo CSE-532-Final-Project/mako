@@ -120,6 +120,11 @@ protected:
   ABORT_REASONS(EVENT_COUNTER_DEF_X)
 #undef EVENT_COUNTER_DEF_X
 
+  // ELV instrumentation
+  static event_counter g_evt_elv_lock_conflicts;
+  static event_counter g_evt_elv_validation_aborts;
+  static event_counter g_evt_elv_intent_reads;
+
   static event_counter *
   AbortReasonCounter(abort_reason reason)
   {

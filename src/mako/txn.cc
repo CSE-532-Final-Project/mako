@@ -5,6 +5,7 @@
 #include "txn_btree.h"
 #include "lockguard.h"
 #include "scopedperf.hh"
+#include "elv.h"
 
 #include <algorithm>
 #include <iostream>
@@ -14,6 +15,8 @@
 
 using namespace std;
 using namespace util;
+
+std::atomic<bool> g_enable_elv{false};
 
 // @unsafe: uses stringstream
 static string
@@ -56,6 +59,10 @@ CLASS_STATIC_COUNTER_IMPL(transaction_base, scopedperf::tsc_ctr, g_txn_commit_pr
   event_counter transaction_base::g_ ## x ## _ctr(#x);
 ABORT_REASONS(EVENT_COUNTER_IMPL_X)
 #undef EVENT_COUNTER_IMPL_X
+
+event_counter transaction_base::g_evt_elv_lock_conflicts("elv_lock_conflicts");
+event_counter transaction_base::g_evt_elv_validation_aborts("elv_validation_aborts");
+event_counter transaction_base::g_evt_elv_intent_reads("elv_intent_reads");
 
 event_counter transaction_base::g_evt_read_logical_deleted_node_search
     ("read_logical_deleted_node_search");

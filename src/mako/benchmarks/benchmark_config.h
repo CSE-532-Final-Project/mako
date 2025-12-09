@@ -57,6 +57,7 @@ class BenchmarkConfig {
           control_mode_(0),
           verbose_(1),
           txn_flags_(1),
+          enable_elv_(0),
           runtime_(30),
           runtime_plus_(0),
           ops_per_worker_(0),
@@ -87,6 +88,7 @@ class BenchmarkConfig {
       volatile int control_mode_;
       int verbose_;
       uint64_t txn_flags_;
+      int enable_elv_;
       double scale_factor_;
       uint64_t runtime_;
       volatile int runtime_plus_;
@@ -163,6 +165,7 @@ class BenchmarkConfig {
       int getControlMode() const { return control_mode_; }
       int getVerbose() const { return verbose_; }
       uint64_t getTxnFlags() const { return txn_flags_; }
+      int getEnableElv() const { return enable_elv_; }
       double getScaleFactor() const { return scale_factor_; }
       uint64_t getRuntime() const { return runtime_; }
       int getRuntimePlus() const { return runtime_plus_; }
@@ -212,6 +215,7 @@ class BenchmarkConfig {
       void setControlMode(int mode) { control_mode_ = mode; }
       void setVerbose(int v) { verbose_ = v; }
       void setTxnFlags(uint64_t flags) { txn_flags_ = flags; }
+      void setEnableElv(int enable) { enable_elv_ = enable; }
       void setScaleFactor(double sf) { scale_factor_ = sf; }
       void setRuntime(uint64_t rt) { runtime_ = rt; }
       void setRuntimePlus(int rtp) { runtime_plus_ = rtp; }

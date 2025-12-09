@@ -3,6 +3,7 @@
 
 #include "txn.h"
 #include "lockguard.h"
+#include "elv.h"
 
 // base definitions
 
@@ -60,6 +61,15 @@ transaction<Protocol, Traits>::abort_impl(abort_reason reason)
   }
   state = TXN_ABRT;
   this->reason = reason;
+  if (reason == transaction_base::ABORT_REASON_WRITE_NODE_INTERFERENCE ||
+      reason == transaction_base::ABORT_REASON_INSERT_NODE_INTERFERENCE)
+    ++transaction_base::g_evt_elv_lock_conflicts;
+  if (reason == transaction_base::ABORT_REASON_READ_NODE_INTEREFERENCE ||
+      reason == transaction_base::ABORT_REASON_NODE_SCAN_READ_VERSION_CHANGED ||
+      reason == transaction_base::ABORT_REASON_NODE_SCAN_WRITE_VERSION_CHANGED ||
+      reason == transaction_base::ABORT_REASON_UNSTABLE_READ ||
+      reason == transaction_base::ABORT_REASON_FUTURE_TID_READ)
+    ++transaction_base::g_evt_elv_validation_aborts;
 
   // on abort, we need to go over all insert nodes and
   // release the locks
@@ -199,9 +209,9 @@ transaction<Protocol, Traits>::handle_last_tuple_in_group(
     // don't need to lock
     if (!last.is_insert())
       // we inserted the last run, and then we did 1+ more overwrites
-      // to it, so we do NOT need to lock the node (again), but we DO
-      // need to apply the latest write
-      last.entry->set_do_write();
+          // to it, so we do NOT need to lock the node (again), but we DO
+          // need to apply the latest write
+          last.entry->set_do_write();
   } else {
     dbtuple *tuple = last.get_tuple();
     if (unlikely(tuple->version == dbtuple::MAX_TID)) {
@@ -318,12 +328,13 @@ transaction<Protocol, Traits>::commit(bool doThrow)
       }
       if (likely(last_px) &&
           unlikely(!handle_last_tuple_in_group(*last_px, inserted_last_run))) {
-        abort_trap((reason = ABORT_REASON_WRITE_NODE_INTERFERENCE));
-        goto do_abort;
-      }
-      commit_tid.first = true;
-      PERF_DECL(
-          static std::string probe5_name(
+      abort_trap((reason = ABORT_REASON_WRITE_NODE_INTERFERENCE));
+      ++transaction_base::g_evt_elv_lock_conflicts;
+      goto do_abort;
+    }
+    commit_tid.first = true;
+    PERF_DECL(
+        static std::string probe5_name(
             std::string(__PRETTY_FUNCTION__) + std::string(":gen_commit_tid:")));
       ANON_REGION(probe5_name.c_str(), &transaction_base::g_txn_commit_probe5_cg);
       commit_tid.second = cast()->gen_commit_tid(write_dbtuples);
@@ -363,6 +374,7 @@ transaction<Protocol, Traits>::commit(bool doThrow)
           //std::cerr << "failed tuple: " << *it->get_tuple() << std::endl;
 
           abort_trap((reason = ABORT_REASON_READ_NODE_INTEREFERENCE));
+          ++transaction_base::g_evt_elv_validation_aborts;
           goto do_abort;
         }
       }
@@ -377,6 +389,7 @@ transaction<Protocol, Traits>::commit(bool doThrow)
             VERBOSE(std::cerr << "expected node " << util::hexify(it->first) << " at v="
                               << it->second.version << ", got v=" << v << std::endl);
             abort_trap((reason = ABORT_REASON_NODE_SCAN_READ_VERSION_CHANGED));
+            ++transaction_base::g_evt_elv_validation_aborts;
             goto do_abort;
           }
         }
@@ -574,6 +587,11 @@ transaction<Protocol, Traits>::do_tuple_read(
   const transaction_base::tid_t snapshot_tid = is_snapshot_txn ?
     cast()->snapshot_tid() : static_cast<transaction_base::tid_t>(dbtuple::MAX_TID);
   transaction_base::tid_t start_t = 0;
+  const bool elv_bypass = elv_enabled() && !is_snapshot_txn;
+  const bool has_stable_version = tuple->version != dbtuple::MAX_TID;
+  const bool allow_intent_reads = is_snapshot_txn || (elv_bypass && has_stable_version);
+  const bool saw_intent_before_read =
+    elv_bypass && has_stable_version && tuple->is_write_intent();
 
   if (Traits::read_own_writes) {
     // this is why read_own_writes is not performant, because we have
@@ -597,13 +615,18 @@ transaction<Protocol, Traits>::do_tuple_read(
     PERF_DECL(static std::string probe0_name(std::string(__PRETTY_FUNCTION__) + std::string(":do_read:")));
     ANON_REGION(probe0_name.c_str(), &private_::txn_btree_search_probe0_cg);
     tuple->prefetch();
-    stat = tuple->stable_read(snapshot_tid, start_t, value_reader, this->string_allocator(), is_snapshot_txn);
+    stat = tuple->stable_read(
+        snapshot_tid, start_t, value_reader, this->string_allocator(),
+        allow_intent_reads);
     if (unlikely(stat == dbtuple::READ_FAILED)) {
       const transaction_base::abort_reason r = transaction_base::ABORT_REASON_UNSTABLE_READ;
       abort_impl(r);
       throw transaction_abort_exception(r);
     }
   }
+  if (elv_bypass && saw_intent_before_read &&
+      stat == dbtuple::READ_RECORD)
+    ++transaction_base::g_evt_elv_intent_reads;
   if (unlikely(!cast()->can_read_tid(start_t))) {
     const transaction_base::abort_reason r = transaction_base::ABORT_REASON_FUTURE_TID_READ;
     abort_impl(r);
