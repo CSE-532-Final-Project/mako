@@ -1053,6 +1053,7 @@ if(BUILD_TESTS)
     # Common test include directories
     set(TEST_INCLUDE_DIRS
         src
+        src/deptran
         src/rrr
         src/memdb
         src/mako
@@ -1067,6 +1068,7 @@ if(BUILD_TESTS)
     set(TEST_LINK_LIBS
         rrr
         memdb
+        txlog
         pthread
         ${BENCH_LDFLAGS}
         ${LIBEVENT_LDFLAGS}
@@ -1099,6 +1101,13 @@ if(BUILD_TESTS)
     target_compile_options(test_future PRIVATE ${TEST_COMPILE_OPTIONS})
     target_link_libraries(test_future ${TEST_LINK_LIBS} ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} pthread)
     add_test(NAME test_future COMMAND test_future)
+
+    # Controlled lock violation unit tests
+    add_executable(test_clv test/test_clv.cc)
+    target_include_directories(test_clv PRIVATE ${TEST_INCLUDE_DIRS} ${GTEST_INCLUDE_DIRS})
+    target_compile_options(test_clv PRIVATE ${TEST_COMPILE_OPTIONS})
+    target_link_libraries(test_clv ${TEST_LINK_LIBS} ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} pthread)
+    add_test(NAME test_clv COMMAND test_clv)
 
     # Future Performance Benchmark (not run in test suite)
     add_executable(bench_future test/bench_future.cc)

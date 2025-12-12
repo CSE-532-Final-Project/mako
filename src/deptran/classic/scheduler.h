@@ -84,6 +84,9 @@ class SchedulerClassic: public TxLogServer {
 
   bool CheckCommitted(Marshallable& commit_cmd) override;
 
+ protected:
+  void CascadeAbort(Tx& tx_box);
+
 };
 
 } // namespace janus

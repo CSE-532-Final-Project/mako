@@ -5,10 +5,13 @@
 #pragma once
 
 #include "deptran/classic/scheduler.h"
+#include <mutex>
+#include <unordered_map>
 
 namespace janus {
 
 class Executor;
+class Tx2pl;
 class Scheduler2pl: public SchedulerClassic {
  public:
   Scheduler2pl();
@@ -46,6 +49,26 @@ class Scheduler2pl: public SchedulerClassic {
   virtual void DoCommit(Tx& tx_box) override;
 
   virtual void DoAbort(Tx& tx_box) override;
+
+ private:
+  struct LockHolder {
+    std::weak_ptr<Tx2pl> tx;
+    bool physical{false};
+    uint64_t req_id{0};
+  };
+
+  std::unordered_map<ALock*, std::vector<LockHolder>> lock_table_;
+  std::mutex lock_table_mutex_;
+
+  void RegisterLockHolder(ALock* lock,
+                          const std::shared_ptr<Tx2pl>& tx,
+                          uint64_t req_id,
+                          bool physical);
+  void RemoveLockHolder(ALock* lock, txnid_t tx_id, bool physical);
+  bool CanViolate(ALock* lock,
+                  const std::shared_ptr<Tx2pl>& requesting_tx,
+                  std::vector<std::shared_ptr<Tx2pl>>* blockers);
+  void CleanupExpiredHolders(ALock* lock);
 };
 
 } // namespace janus

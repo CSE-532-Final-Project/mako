@@ -17,6 +17,7 @@
 #include "config.h"
 
 #include <algorithm>
+#include <cstring>
 #include <gperftools/profiler.h>
 
 namespace janus {
@@ -325,6 +326,96 @@ void TxLogServer::Resume() {
   commo_->Resume();
   paused_ = false;
 };
+
+uint64_t TxLogServer::AllocateCommitLsn() {
+  return next_commit_lsn_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t TxLogServer::DurableLsn() const {
+  return durable_lsn_.load(std::memory_order_acquire);
+}
+
+uint64_t TxLogServer::StageCommitRecord(const shared_ptr<Tx> &tx) {
+  auto lsn = AllocateCommitLsn();
+  tx->MarkCommitRecordStaged(lsn);
+  TrackDurability(tx, lsn);
+  SubmitCommitLog(tx, lsn);
+  return lsn;
+}
+
+void TxLogServer::TrackDurability(const shared_ptr<Tx> &tx, uint64_t lsn) {
+  if (DurableLsn() >= lsn) {
+    tx->MarkDurable(DurableLsn());
+    return;
+  }
+  std::lock_guard<std::mutex> guard(durability_mtx_);
+  auto durable_now = durable_lsn_.load(std::memory_order_acquire);
+  if (durable_now >= lsn) {
+    tx->MarkDurable(durable_now);
+    return;
+  }
+  durability_waiters_[lsn].push_back(tx);
+}
+
+void TxLogServer::SubmitCommitLog(const shared_ptr<Tx> &tx, uint64_t lsn) {
+  if (recorder_ == nullptr) {
+    AdvanceDurableLsn(lsn);
+    return;
+  }
+  std::string payload;
+  payload.resize(sizeof(lsn) + sizeof(tx->tid_));
+  memcpy(payload.data(), &lsn, sizeof(lsn));
+  memcpy(payload.data() + sizeof(lsn), &tx->tid_, sizeof(tx->tid_));
+
+  recorder_->submit(payload, [this, lsn]() {
+    AdvanceDurableLsn(lsn);
+  });
+}
+
+void TxLogServer::AdvanceDurableLsn(uint64_t upto_lsn) {
+  uint64_t current = durable_lsn_.load(std::memory_order_acquire);
+  while (upto_lsn > current &&
+         !durable_lsn_.compare_exchange_weak(current,
+                                             upto_lsn,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+  }
+  if (upto_lsn <= current) {
+    durability_cv_.notify_all();
+    return;
+  }
+  std::vector<std::shared_ptr<Tx>> ready;
+  {
+    std::lock_guard<std::mutex> guard(durability_mtx_);
+    auto it = durability_waiters_.begin();
+    while (it != durability_waiters_.end() && it->first <= upto_lsn) {
+      for (auto &weak_tx : it->second) {
+        if (auto tx = weak_tx.lock()) {
+          ready.push_back(tx);
+        }
+      }
+      it = durability_waiters_.erase(it);
+    }
+  }
+  for (auto &tx : ready) {
+    tx->MarkDurable(upto_lsn);
+  }
+  durability_cv_.notify_all();
+}
+
+void TxLogServer::WaitForCommitDependencies(const shared_ptr<Tx> &tx) {
+  if (!tx) {
+    return;
+  }
+  auto required = tx->required_commit_lsn();
+  if (required == 0) {
+    return;
+  }
+  std::unique_lock<std::mutex> guard(durability_mtx_);
+  durability_cv_.wait(guard, [&]() {
+    return durable_lsn_.load(std::memory_order_acquire) >= required;
+  });
+}
 
 void TxLogServer::TriggerUpgradeEpoch() {
   if (site_id_ == 0) {

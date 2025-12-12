@@ -11,7 +11,9 @@
 #include "classic/tpc_command.h"
 #include "RW_command.h"
 #include "config.h"
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 
 namespace janus {
 
@@ -357,6 +359,11 @@ class TxLogServer {
   shared_ptr<mdb::TxnMgr> mdb_txn_mgr_{};
   int mode_;
   Recorder *recorder_ = nullptr;
+  std::atomic<uint64_t> next_commit_lsn_{1};
+  std::atomic<uint64_t> durable_lsn_{0};
+  std::map<uint64_t, std::vector<std::weak_ptr<Tx>>> durability_waiters_{};
+  std::mutex durability_mtx_;
+  std::condition_variable durability_cv_;
   Frame *frame_ = nullptr;
   Frame *rep_frame_ = nullptr;
   TxLogServer *tx_sched_ = nullptr;
@@ -511,6 +518,14 @@ class TxLogServer {
 	virtual bool RequestVote() { verify(0); return false;};
   virtual void Pause();
   virtual void Resume();
+
+  uint64_t StageCommitRecord(const shared_ptr<Tx>& tx);
+  uint64_t AllocateCommitLsn();
+  void TrackDurability(const shared_ptr<Tx>& tx, uint64_t lsn);
+  void SubmitCommitLog(const shared_ptr<Tx>& tx, uint64_t lsn);
+  void AdvanceDurableLsn(uint64_t upto_lsn);
+  uint64_t DurableLsn() const;
+  void WaitForCommitDependencies(const shared_ptr<Tx>& tx);
 
   // epoch related functions
   void TriggerUpgradeEpoch();

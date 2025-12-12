@@ -219,9 +219,9 @@ int SchedulerClassic::OnEarlyAbort(txnid_t tx_id) {
 }
 
 int SchedulerClassic::OnCommit(txnid_t tx_id,
-															 struct DepId dep_id,
-															 int commit_or_abort) {
-  std::lock_guard<std::recursive_mutex> lock(mtx_);
+                               struct DepId dep_id,
+                               int commit_or_abort) {
+  std::unique_lock<std::recursive_mutex> lock(mtx_);
   Log_debug("%s: at site %d, tx: %" PRIx64,
             __FUNCTION__, this->site_id_, tx_id);
   Log_debug("Coordinator invokes Submit to submit a request to a specific protocol");
@@ -238,6 +238,17 @@ int SchedulerClassic::OnCommit(txnid_t tx_id,
   Log_info("cmd<%d, %d> entered SchedulerClassic::OnCommit, Config::GetConfig()->IsReplicated()=%d",
     SimpleRWCommand::GetCmdID(sp_tx->cmd_).first, SimpleRWCommand::GetCmdID(sp_tx->cmd_).second, Config::GetConfig()->IsReplicated());
 #endif
+
+  if (commit_or_abort == SUCCESS && !sp_tx->HasCommitRecord()) {
+    StageCommitRecord(sp_tx);
+  }
+
+  if (commit_or_abort == SUCCESS && sp_tx->required_commit_lsn() > 0) {
+    lock.unlock();
+    WaitForCommitDependencies(sp_tx);
+    lock.lock();
+  }
+
   if (Config::GetConfig()->IsReplicated()) {
     auto cmd = std::make_shared<TpcCommitCommand>();
     cmd->tx_id_ = tx_id;
@@ -289,6 +300,7 @@ void SchedulerClassic::DoCommit(Tx& tx_box) {
   mdb_txn->commit();
   tx_box.mdb_txn_ = nullptr;
   delete mdb_txn; // TODO remove this
+  tx_box.ClearDependents();
 }
 
 void SchedulerClassic::DoAbort(Tx& tx_box) {
@@ -297,6 +309,19 @@ void SchedulerClassic::DoAbort(Tx& tx_box) {
   mdb_txn->abort();
   delete mdb_txn; // TODO remove this
   tx_box.mdb_txn_ = nullptr;
+  CascadeAbort(tx_box);
+}
+
+void SchedulerClassic::CascadeAbort(Tx& tx_box) {
+  auto dependents = tx_box.TakeDependents();
+  for (auto &dependent : dependents) {
+    if (!dependent || dependent->aborted_) {
+      continue;
+    }
+    Log_debug("Cascade abort from %" PRIx64 " to %" PRIx64,
+              tx_box.tid_, dependent->tid_);
+    OnEarlyAbort(dependent->tid_);
+  }
 }
 
 int SchedulerClassic::CommitReplicated(TpcCommitCommand& tpc_commit_cmd) {

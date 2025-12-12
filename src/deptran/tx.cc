@@ -149,4 +149,90 @@ mdb::Table *Tx::GetTable(const std::string &tbl_name) const {
   return sched_->get_table(tbl_name);
 }
 
+void Tx::MarkCommitRecordStaged(uint64_t lsn) {
+  vector<std::function<void(uint64_t)>> callbacks;
+  {
+    std::lock_guard<std::mutex> guard(commit_state_mutex_);
+    auto state = commit_state_.load();
+    if (state == CommitState::COMMIT_RECORD_STAGED ||
+        state == CommitState::DURABLE) {
+      return;
+    }
+    commit_lsn_.store(lsn, std::memory_order_release);
+    commit_state_.store(CommitState::COMMIT_RECORD_STAGED,
+                        std::memory_order_release);
+    callbacks.swap(commit_lsn_waiters_);
+  }
+  for (auto &cb : callbacks) {
+    if (cb) {
+      cb(lsn);
+    }
+  }
+}
+
+void Tx::MarkDurable(uint64_t lsn) {
+  durable_lsn_.store(lsn, std::memory_order_release);
+  commit_state_.store(CommitState::DURABLE, std::memory_order_release);
+}
+
+void Tx::RegisterCommitLsnCallback(const std::function<void(uint64_t)> &cb) {
+  if (!cb) {
+    return;
+  }
+  uint64_t ready_lsn = 0;
+  bool fire_now = false;
+  {
+    std::lock_guard<std::mutex> guard(commit_state_mutex_);
+    auto state = commit_state_.load();
+    if (state == CommitState::COMMIT_RECORD_STAGED ||
+        state == CommitState::DURABLE) {
+      ready_lsn = commit_lsn_.load(std::memory_order_acquire);
+      fire_now = true;
+    } else {
+      commit_lsn_waiters_.push_back(cb);
+    }
+  }
+  if (fire_now) {
+    cb(ready_lsn);
+  }
+}
+
+void Tx::RecordDependencyLsn(uint64_t lsn) {
+  if (lsn == 0) {
+    return;
+  }
+  uint64_t current = required_commit_lsn_.load(std::memory_order_acquire);
+  while (lsn > current &&
+         !required_commit_lsn_.compare_exchange_weak(current,
+                                                     lsn,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+  }
+}
+
+void Tx::AddDependent(const std::shared_ptr<Tx>& dependent) {
+  if (!dependent) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(dependency_mutex_);
+  dependents_.push_back(dependent);
+}
+
+std::vector<std::shared_ptr<Tx>> Tx::TakeDependents() {
+  std::vector<std::shared_ptr<Tx>> result;
+  std::lock_guard<std::mutex> guard(dependency_mutex_);
+  for (auto &weak_tx : dependents_) {
+    if (auto tx = weak_tx.lock()) {
+      result.push_back(tx);
+    }
+  }
+  dependents_.clear();
+  return result;
+}
+
+void Tx::ClearDependents() {
+  std::lock_guard<std::mutex> guard(dependency_mutex_);
+  dependents_.clear();
+}
+
 } // namespace janus

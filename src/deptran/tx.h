@@ -15,6 +15,10 @@
 #include "multi_value.h"
 #include "txn_reg.h"
 #include "procedure.h"
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <vector>
 
 namespace janus {
 
@@ -64,6 +68,21 @@ class Tx: public enable_shared_from_this<Tx> {
 
   bool committed_{false};
   bool aborted_{false};
+
+  enum class CommitState : uint8_t {
+    ACTIVE = 0,
+    COMMIT_RECORD_STAGED,
+    DURABLE
+  };
+
+  std::atomic<CommitState> commit_state_{CommitState::ACTIVE};
+  std::atomic<uint64_t> commit_lsn_{0};
+  std::atomic<uint64_t> durable_lsn_{0};
+  std::atomic<uint64_t> required_commit_lsn_{0};
+  mutable std::mutex commit_state_mutex_;
+  std::vector<std::function<void(uint64_t)>> commit_lsn_waiters_{};
+  mutable std::mutex dependency_mutex_;
+  std::vector<std::weak_ptr<Tx>> dependents_{};
 
   map<innid_t, std::unique_ptr<IntEvent>> paused_pieces_{};
   map<int64_t, mdb::Row *> context_row_;
@@ -125,6 +144,24 @@ class Tx: public enable_shared_from_this<Tx> {
                                  int rs_context_id = 0);
 
   virtual mdb::Table *GetTable(const std::string &tbl_name) const;
+
+  CommitState commit_state() const { return commit_state_.load(); }
+  bool HasCommitRecord() const {
+    auto state = commit_state_.load();
+    return state == CommitState::COMMIT_RECORD_STAGED ||
+           state == CommitState::DURABLE;
+  }
+  bool IsDurable() const { return commit_state_.load() == CommitState::DURABLE; }
+  uint64_t commit_lsn() const { return commit_lsn_.load(); }
+  uint64_t durable_lsn() const { return durable_lsn_.load(); }
+  uint64_t required_commit_lsn() const { return required_commit_lsn_.load(); }
+  void MarkCommitRecordStaged(uint64_t lsn);
+  void MarkDurable(uint64_t lsn);
+  void RegisterCommitLsnCallback(const std::function<void(uint64_t)> &cb);
+  void RecordDependencyLsn(uint64_t lsn);
+  void AddDependent(const std::shared_ptr<Tx>& dependent);
+  std::vector<std::shared_ptr<Tx>> TakeDependents();
+  void ClearDependents();
 
   virtual ~Tx();
 };
