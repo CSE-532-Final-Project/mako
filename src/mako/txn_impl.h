@@ -19,6 +19,22 @@ transaction<Protocol, Traits>::transaction(uint64_t flags, string_allocator_type
 #ifdef BTREE_LOCK_OWNERSHIP_CHECKING
   concurrent_btree::NodeLockRegionBegin();
 #endif
+
+#ifdef ENABLE_ELR
+  // Initialize ELR state for this transaction
+  // Generate unique transaction ID using thread ID and counter
+  static thread_local uint64_t txn_counter = 0;
+  elr_txn_id_ = (static_cast<uint64_t>(TThread::id()) << 32) | (++txn_counter);
+  elr_shard_id_ = static_cast<mako::elr::shardid_t>(TThread::get_shard_index());
+  elr_released_ = false;
+  elr_can_abort_ = true;
+  elr_dependencies_.clear();
+  
+  // Register transaction with ELR manager
+  if (mako::elr::elr_enabled()) {
+    mako::elr::ELRIntegration::getInstance().onTransactionBegin(elr_shard_id_, elr_txn_id_);
+  }
+#endif
 }
 
 template <template <typename> class Protocol, typename Traits>

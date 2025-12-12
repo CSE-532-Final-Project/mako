@@ -20,6 +20,7 @@
 #ifdef ENABLE_ELR
 #include "elr/elr_manager.h"
 #include "elr/elr_common.h"
+#include "elr/elr_integration.h"
 #endif
 
 std::function<int()> ss_callback_ = nullptr;
@@ -741,6 +742,22 @@ namespace mako
         queue_response = queueY;
         open_tables_table_id = open_tablesX;
         shardReceiver->Register(db, open_tables_table_id);
+
+#ifdef ENABLE_ELR
+        // Initialize ELR for this shard
+        mako::elr::ELRIntegrationConfig elr_config;
+        elr_config.enable_elr = true;
+        elr_config.safe_point = "post_validate";
+        elr_config.max_chain_depth = 5;
+        elr_config.cascade_timeout_ms = 1000;
+        elr_config.cross_shard_elr = true;
+        elr_config.enable_logging = true;
+        
+        mako::elr::ELRIntegration::getInstance().initialize(
+            static_cast<mako::elr::shardid_t>(serverShardIndex), elr_config);
+        
+        Notice("ELR initialized for shard %d", serverShardIndex);
+#endif
     }
 
     void ShardServer::UpdateTable(int table_id, abstract_ordered_index *table)

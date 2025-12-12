@@ -544,6 +544,20 @@ set(MAKO_SRCFILES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/benchmarks/abstract_db.cc"
 )
 
+# Early Lock Release (ELR) source files - conditionally included
+option(ENABLE_ELR "Enable Early Lock Release for reduced contention" OFF)
+if(ENABLE_ELR)
+  list(APPEND MAKO_SRCFILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_manager.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/dependency_tracker.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/cascade_abort.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_log.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_integration.cc"
+  )
+  add_compile_definitions(ENABLE_ELR)
+  message(STATUS "Early Lock Release (ELR) enabled")
+endif()
+
 # Benchmark flags
 set(BENCH_CXXFLAGS ${CXXFLAGS})
 set(BENCH_LDFLAGS

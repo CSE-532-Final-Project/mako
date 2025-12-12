@@ -1213,26 +1213,16 @@ public:
       return false;
     }
     
-    // Get the write set from Sto and early-release locks
-    auto write_set = Sto::get_write_set();
+    // Note: The actual early release logic is handled in txn_impl.h
+    // during the commit process after validation passes.
+    // This method is called from the server-side RPC handler.
+    
+    // For server-side early release requests, we just mark the intention
+    // The actual lock release happens in the transaction commit path
     std::vector<ELRKey> keys;
+    // Keys would be passed from the RPC request
     
-    for (const auto& item : write_set) {
-      ELRKey key;
-      key.shard_id = TThread::get_shard_index();
-      key.table_id = item.table_id;
-      key.key = item.key;
-      keys.push_back(key);
-    }
-    
-    // Perform early release
     auto result = elr_manager.earlyRelease(txn_id, keys);
-    
-    if (result.success) {
-      // Tell Sto to release locks but keep tracking
-      Sto::early_release_locks();
-    }
-    
     return result.success;
   }
 
@@ -1245,10 +1235,7 @@ public:
     
     auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
     
-    // Get cascade abort set
-    auto cascade_set = elr_manager.getCascadeAbortSet(txn_id);
-    
-    // Abort the transaction
+    // Abort the transaction and get cascade set
     auto result = elr_manager.abortTransaction(txn_id);
     
     // Also abort locally via Sto
@@ -1284,14 +1271,9 @@ public:
       return false;
     }
     
-    // Check transaction state via Sto
-    if (!Sto::is_in_progress()) {
-      return false;
-    }
-    
-    // Check with ELR manager
+    // Check with ELR manager using transaction pointer as ID
     auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
-    uint64_t txn_id = reinterpret_cast<uint64_t>(txn); // Simplified txn ID
+    uint64_t txn_id = reinterpret_cast<uint64_t>(txn);
     return elr_manager.canEarlyRelease(txn_id);
   }
 
