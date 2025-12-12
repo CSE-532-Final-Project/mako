@@ -77,6 +77,15 @@ namespace mako
         case controlReqType:
             HandleControlReply(respBuf);
             break;
+        case earlyReleaseReqType:
+            HandleEarlyReleaseReply(respBuf);
+            break;
+        case cascadeAbortReqType:
+            HandleCascadeAbortReply(respBuf);
+            break;
+        case elrDependencyReqType:
+            HandleELRDependencyReply(respBuf);
+            break;
         case warmupReqType:
             HandleWarmupReply(respBuf);
             break;
@@ -599,6 +608,178 @@ namespace mako
             // for abort itself, we do nothing
         }
 
+    }
+
+    // =========================================================================
+    // Early Lock Release (ELR) Methods
+    // =========================================================================
+
+    void Client::InvokeEarlyRelease(uint64_t txn_nr,
+                                    uint64_t txn_id,
+                                    int dstShardIdx,
+                                    uint16_t server_id,
+                                    const std::vector<std::pair<uint16_t, std::string>>& keys,
+                                    resp_continuation_t continuation,
+                                    error_continuation_t error_continuation,
+                                    uint32_t timeout)
+    {
+        Debug("invoke InvokeEarlyRelease\n");
+        uint32_t reqId = ++lastReqId;
+        reqId *= 10;
+
+        crtReqK = PendingRequestK("InvokeEarlyRelease",
+                                  reqId, txn_nr, server_id,
+                                  continuation, error_continuation);
+
+        EarlyReleaseRequestWrapper wrapper(txn_id, server_id);
+        for (const auto& [table_id, key] : keys) {
+            wrapper.add_key(table_id, key);
+        }
+        wrapper.set_req_nr(reqId + current_term);
+
+        auto *reqBuf = reinterpret_cast<early_release_request_t *>(
+            transport->GetRequestBuf(
+                wrapper.get_msg_len(),
+                sizeof(early_release_response_t)));
+        
+        memcpy(reqBuf, wrapper.get_request(), wrapper.get_msg_len());
+        
+        blocked = true;
+        transport->SendRequestToAll(this,
+                                    earlyReleaseReqType,
+                                    dstShardIdx,
+                                    config.warehouses + 5 + server_id % TThread::get_num_erpc_server(),
+                                    sizeof(early_release_response_t),
+                                    wrapper.get_msg_len());
+    }
+
+    void Client::InvokeCascadeAbort(uint64_t txn_nr,
+                                    uint64_t txn_id,
+                                    uint64_t cause_txn_id,
+                                    int dstShardIdx,
+                                    uint16_t server_id,
+                                    uint32_t source_shard,
+                                    uint64_t cascade_id,
+                                    resp_continuation_t continuation,
+                                    error_continuation_t error_continuation,
+                                    uint32_t timeout)
+    {
+        Debug("invoke InvokeCascadeAbort\n");
+        uint32_t reqId = ++lastReqId;
+        reqId *= 10;
+
+        crtReqK = PendingRequestK("InvokeCascadeAbort",
+                                  reqId, txn_nr, server_id,
+                                  continuation, error_continuation);
+
+        auto *reqBuf = reinterpret_cast<cascade_abort_request_t *>(
+            transport->GetRequestBuf(
+                sizeof(cascade_abort_request_t),
+                sizeof(cascade_abort_response_t)));
+        
+        reqBuf->target_server_id = server_id;
+        reqBuf->req_nr = reqId + current_term;
+        reqBuf->txn_id = txn_id;
+        reqBuf->cause_txn_id = cause_txn_id;
+        reqBuf->source_shard = source_shard;
+        reqBuf->cascade_id = cascade_id;
+        
+        blocked = true;
+        transport->SendRequestToAll(this,
+                                    cascadeAbortReqType,
+                                    dstShardIdx,
+                                    config.warehouses + 5 + server_id % TThread::get_num_erpc_server(),
+                                    sizeof(cascade_abort_response_t),
+                                    sizeof(cascade_abort_request_t));
+    }
+
+    void Client::InvokeELRDependency(uint64_t txn_nr,
+                                     uint64_t reader_txn_id,
+                                     uint64_t writer_txn_id,
+                                     int dstShardIdx,
+                                     uint16_t server_id,
+                                     uint16_t table_id,
+                                     const std::string& key,
+                                     resp_continuation_t continuation,
+                                     error_continuation_t error_continuation,
+                                     uint32_t timeout)
+    {
+        Debug("invoke InvokeELRDependency\n");
+        uint32_t reqId = ++lastReqId;
+        reqId *= 10;
+
+        crtReqK = PendingRequestK("InvokeELRDependency",
+                                  reqId, txn_nr, server_id,
+                                  continuation, error_continuation);
+
+        auto *reqBuf = reinterpret_cast<elr_dependency_request_t *>(
+            transport->GetRequestBuf(
+                sizeof(elr_dependency_request_t),
+                sizeof(elr_dependency_response_t)));
+        
+        reqBuf->target_server_id = server_id;
+        reqBuf->req_nr = reqId + current_term;
+        reqBuf->reader_txn_id = reader_txn_id;
+        reqBuf->writer_txn_id = writer_txn_id;
+        reqBuf->table_id = table_id;
+        reqBuf->key_len = static_cast<uint16_t>(key.size());
+        memcpy(reqBuf->key, key.c_str(), key.size());
+        
+        blocked = true;
+        transport->SendRequestToAll(this,
+                                    elrDependencyReqType,
+                                    dstShardIdx,
+                                    config.warehouses + 5 + server_id % TThread::get_num_erpc_server(),
+                                    sizeof(elr_dependency_response_t),
+                                    sizeof(elr_dependency_request_t));
+    }
+
+    void Client::HandleEarlyReleaseReply(char *respBuf)
+    {
+        auto *resp = reinterpret_cast<early_release_response_t *>(respBuf);
+        Debug("[%lu]Received HandleEarlyReleaseReply, req_nr: %d\n", clientid, resp->req_nr);
+        if (resp->req_nr != crtReqK.req_nr) {
+            return;
+        }
+
+        crtReqK.resp_continuation(respBuf);
+        if (num_response_waiting) num_response_waiting--;
+        if (num_response_waiting == 0) {
+            blocked = false;
+            crtReqK.req_nr = 0;
+        }
+    }
+
+    void Client::HandleCascadeAbortReply(char *respBuf)
+    {
+        auto *resp = reinterpret_cast<cascade_abort_response_t *>(respBuf);
+        Debug("[%lu]Received HandleCascadeAbortReply, req_nr: %d\n", clientid, resp->req_nr);
+        if (resp->req_nr != crtReqK.req_nr) {
+            return;
+        }
+
+        crtReqK.resp_continuation(respBuf);
+        if (num_response_waiting) num_response_waiting--;
+        if (num_response_waiting == 0) {
+            blocked = false;
+            crtReqK.req_nr = 0;
+        }
+    }
+
+    void Client::HandleELRDependencyReply(char *respBuf)
+    {
+        auto *resp = reinterpret_cast<elr_dependency_response_t *>(respBuf);
+        Debug("[%lu]Received HandleELRDependencyReply, req_nr: %d\n", clientid, resp->req_nr);
+        if (resp->req_nr != crtReqK.req_nr) {
+            return;
+        }
+
+        crtReqK.resp_continuation(respBuf);
+        if (num_response_waiting) num_response_waiting--;
+        if (num_response_waiting == 0) {
+            blocked = false;
+            crtReqK.req_nr = 0;
+        }
     }
 
     void Client::HandleGetReply(char *respBuf)

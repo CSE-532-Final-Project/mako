@@ -173,6 +173,88 @@ public:
   virtual void shard_serialize_util(uint32_t timestamp)  = 0;
   virtual void shard_unlock(bool committed) = 0;
   virtual void shard_reset() = 0;
+
+  // =========================================================================
+  // Early Lock Release (ELR) Interface
+  // =========================================================================
+
+  /**
+   * @brief Perform early release of locks held by the transaction
+   *
+   * This marks locks as early-released, allowing other transactions
+   * to read the uncommitted values while tracking dependencies.
+   *
+   * @param txn Transaction object
+   * @param txn_id Unique transaction ID for ELR tracking
+   * @return true if early release was successful
+   */
+  virtual bool shard_early_release(void *txn, uint64_t txn_id) {
+    // Default implementation: no-op (ELR not supported)
+    (void)txn;
+    (void)txn_id;
+    return false;
+  }
+
+  /**
+   * @brief Handle a cascade abort request
+   *
+   * Called when a transaction that early-released locks aborts,
+   * triggering cascade abort of dependent transactions.
+   *
+   * @param txn_id Transaction ID to abort
+   * @param cause_txn_id Transaction that caused the cascade
+   * @return Number of transactions cascade-aborted
+   */
+  virtual int shard_cascade_abort(uint64_t txn_id, uint64_t cause_txn_id) {
+    // Default implementation: no-op (ELR not supported)
+    (void)txn_id;
+    (void)cause_txn_id;
+    return 0;
+  }
+
+  /**
+   * @brief Register an ELR dependency
+   *
+   * Called when a transaction reads an uncommitted value from
+   * an early-released lock.
+   *
+   * @param reader_txn_id Transaction that is reading
+   * @param writer_txn_id Transaction that early-released
+   * @param table_id Table containing the key
+   * @param key Key being read
+   * @return true if dependency was registered successfully
+   */
+  virtual bool shard_register_elr_dependency(uint64_t reader_txn_id,
+                                              uint64_t writer_txn_id,
+                                              uint16_t table_id,
+                                              const std::string& key) {
+    // Default implementation: no-op (ELR not supported)
+    (void)reader_txn_id;
+    (void)writer_txn_id;
+    (void)table_id;
+    (void)key;
+    return false;
+  }
+
+  /**
+   * @brief Check if early release is safe for a transaction
+   *
+   * @param txn Transaction object
+   * @return true if early release is allowed
+   */
+  virtual bool can_early_release(void *txn) {
+    // Default implementation: ELR not supported
+    (void)txn;
+    return false;
+  }
+
+  /**
+   * @brief Get ELR configuration
+   * @return true if ELR is enabled for this database
+   */
+  virtual bool is_elr_enabled() const {
+    return false;
+  }
 };
 
 #endif /* _ABSTRACT_DB_H_ */

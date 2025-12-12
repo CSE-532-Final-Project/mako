@@ -23,6 +23,10 @@
 #include "prefetch.h"
 #include "ownership_checker.h"
 
+// Early Lock Release (ELR) support
+#ifdef ENABLE_ELR
+#include "elr/elr_common.h"
+#endif
 
 // debugging tool
 //#define TUPLE_LOCK_OWNERSHIP_CHECKING
@@ -99,6 +103,129 @@ private:
 
   static const version_t HDR_VERSION_SHIFT = 5;
   static const version_t HDR_VERSION_MASK = ((version_t)-1) << HDR_VERSION_SHIFT;
+
+  // Early Lock Release (ELR) support
+#ifdef ENABLE_ELR
+  static const version_t HDR_ELR_SHIFT = 5; // Shares space with version in upper bits
+  static const version_t HDR_ELR_RELEASED_MASK = 0x1 << 31; // Top bit indicates ELR
+#endif
+
+public:
+
+#ifdef ENABLE_ELR
+  // ELR state - transaction that early-released this tuple (0 if not ELR)
+  mutable std::atomic<tid_t> elr_owner_txn_{0};
+  
+  // Dependencies - transactions that read this early-released tuple
+  // Note: This is a simple implementation; production would use lock-free list
+  mutable std::atomic<uint32_t> elr_dependent_count_{0};
+  
+  /**
+   * @brief Check if this tuple has been early-released
+   */
+  inline bool
+  is_early_released() const
+  {
+    return elr_owner_txn_.load(std::memory_order_acquire) != 0;
+  }
+  
+  /**
+   * @brief Get the transaction that early-released this tuple
+   */
+  inline tid_t
+  get_elr_owner() const
+  {
+    return elr_owner_txn_.load(std::memory_order_acquire);
+  }
+  
+  /**
+   * @brief Mark this tuple as early-released by a transaction
+   * @param txn_id Transaction that is early-releasing
+   * @return true if successfully marked, false if already released by another
+   */
+  inline bool
+  mark_early_released(tid_t txn_id)
+  {
+    tid_t expected = 0;
+    return elr_owner_txn_.compare_exchange_strong(
+        expected, txn_id, std::memory_order_acq_rel);
+  }
+  
+  /**
+   * @brief Clear the early-release status (on commit or abort)
+   * @param txn_id Transaction that is clearing (must match owner)
+   * @return true if successfully cleared
+   */
+  inline bool
+  clear_early_released(tid_t txn_id)
+  {
+    tid_t expected = txn_id;
+    if (elr_owner_txn_.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel)) {
+      elr_dependent_count_.store(0, std::memory_order_release);
+      return true;
+    }
+    return false;
+  }
+  
+  /**
+   * @brief Increment the count of transactions that depend on this ELR tuple
+   */
+  inline void
+  add_elr_dependent()
+  {
+    elr_dependent_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  
+  /**
+   * @brief Get the count of dependent transactions
+   */
+  inline uint32_t
+  get_elr_dependent_count() const
+  {
+    return elr_dependent_count_.load(std::memory_order_relaxed);
+  }
+  
+  /**
+   * @brief Early release the lock on this tuple
+   *
+   * This allows other transactions to read the uncommitted value,
+   * but tracks the dependency for potential cascade abort.
+   *
+   * @param txn_id Transaction performing early release
+   * @return true if early release was successful
+   */
+  inline bool
+  early_release(tid_t txn_id)
+  {
+    CheckMagic();
+    // Must be locked and owner
+    if (!is_locked() || !is_lock_owner()) {
+      return false;
+    }
+    
+    // Mark as early-released
+    if (!mark_early_released(txn_id)) {
+      return false;
+    }
+    
+    // Release the lock but keep the ELR tracking
+    unlock();
+    return true;
+  }
+  
+  /**
+   * @brief Check if a reader should register a dependency on this tuple
+   *
+   * Returns the ELR owner transaction ID if a dependency should be created,
+   * or 0 if no dependency is needed.
+   */
+  inline tid_t
+  check_elr_dependency() const
+  {
+    return elr_owner_txn_.load(std::memory_order_acquire);
+  }
+#endif // ENABLE_ELR
 
 public:
 

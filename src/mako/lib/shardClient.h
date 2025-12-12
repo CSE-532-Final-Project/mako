@@ -32,6 +32,15 @@ namespace mako
         // Returns SUCCESS if ready, ERROR/TIMEOUT if not ready yet
         int checkRemoteShardReady(int dstShardIndex);
         int remoteInvokeSerializeUtil(uint32_t timestamp);
+        
+        // Early Lock Release (ELR) methods
+        int remoteEarlyRelease(uint64_t txn_id, 
+                               const std::vector<std::pair<uint16_t, std::string>>& keys);
+        int remoteCascadeAbort(uint64_t txn_id, uint64_t cause_txn_id,
+                               uint32_t source_shard, uint64_t cascade_id);
+        int remoteRegisterELRDependency(uint64_t reader_txn_id, uint64_t writer_txn_id,
+                                        uint16_t table_id, const std::string& key);
+        
         void statistics();
         void stop();
         void setBreakTimeout(bool);

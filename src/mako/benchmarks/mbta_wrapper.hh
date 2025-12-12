@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include "abstract_db.h"
 #include "abstract_ordered_index.h"
+
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "../elr/elr_manager.h"
+#include "../elr/elr_common.h"
+#endif
 #include "sto/Transaction.hh"
 #include "sto/MassTrans.hh"
 #include "sto/Hashtable.hh"
@@ -1186,6 +1192,146 @@ public:
   void shard_abort_txn(void *txn) {
     Sto::silent_abort();
   }
+
+  // =========================================================================
+  // Early Lock Release (ELR) Implementation
+  // =========================================================================
+
+#ifdef ENABLE_ELR
+  bool shard_early_release(void *txn, uint64_t txn_id) override {
+    using namespace mako::elr;
+    
+    // Check if ELR is enabled
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    // Check if early release is allowed
+    if (!elr_manager.canEarlyRelease(txn_id)) {
+      return false;
+    }
+    
+    // Get the write set from Sto and early-release locks
+    auto write_set = Sto::get_write_set();
+    std::vector<ELRKey> keys;
+    
+    for (const auto& item : write_set) {
+      ELRKey key;
+      key.shard_id = TThread::get_shard_index();
+      key.table_id = item.table_id;
+      key.key = item.key;
+      keys.push_back(key);
+    }
+    
+    // Perform early release
+    auto result = elr_manager.earlyRelease(txn_id, keys);
+    
+    if (result.success) {
+      // Tell Sto to release locks but keep tracking
+      Sto::early_release_locks();
+    }
+    
+    return result.success;
+  }
+
+  int shard_cascade_abort(uint64_t txn_id, uint64_t cause_txn_id) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return 0;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    // Get cascade abort set
+    auto cascade_set = elr_manager.getCascadeAbortSet(txn_id);
+    
+    // Abort the transaction
+    auto result = elr_manager.abortTransaction(txn_id);
+    
+    // Also abort locally via Sto
+    Sto::silent_abort();
+    
+    return static_cast<int>(result.aborted_txns.size());
+  }
+
+  bool shard_register_elr_dependency(uint64_t reader_txn_id,
+                                      uint64_t writer_txn_id,
+                                      uint16_t table_id,
+                                      const std::string& key) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    ELRKey elr_key;
+    elr_key.shard_id = TThread::get_shard_index();
+    elr_key.table_id = table_id;
+    elr_key.key = key;
+    
+    return elr_manager.registerELRRead(reader_txn_id, writer_txn_id, elr_key, 0);
+  }
+
+  bool can_early_release(void *txn) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    // Check transaction state via Sto
+    if (!Sto::is_in_progress()) {
+      return false;
+    }
+    
+    // Check with ELR manager
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    uint64_t txn_id = reinterpret_cast<uint64_t>(txn); // Simplified txn ID
+    return elr_manager.canEarlyRelease(txn_id);
+  }
+
+  bool is_elr_enabled() const override {
+    return mako::elr::elr_enabled();
+  }
+#else
+  // Stub implementations when ELR is disabled
+  bool shard_early_release(void *txn, uint64_t txn_id) override {
+    (void)txn;
+    (void)txn_id;
+    return false;
+  }
+
+  int shard_cascade_abort(uint64_t txn_id, uint64_t cause_txn_id) override {
+    (void)txn_id;
+    (void)cause_txn_id;
+    return 0;
+  }
+
+  bool shard_register_elr_dependency(uint64_t reader_txn_id,
+                                      uint64_t writer_txn_id,
+                                      uint16_t table_id,
+                                      const std::string& key) override {
+    (void)reader_txn_id;
+    (void)writer_txn_id;
+    (void)table_id;
+    (void)key;
+    return false;
+  }
+
+  bool can_early_release(void *txn) override {
+    (void)txn;
+    return false;
+  }
+
+  bool is_elr_enabled() const override {
+    return false;
+  }
+#endif // ENABLE_ELR
 
   abstract_ordered_index *
   open_index(const std::string &name,

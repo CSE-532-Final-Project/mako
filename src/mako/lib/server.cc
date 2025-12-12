@@ -16,6 +16,12 @@
 #include "deptran/s_main.h"
 #include "benchmarks/sto/sync_util.hh"
 
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "elr/elr_manager.h"
+#include "elr/elr_common.h"
+#endif
+
 std::function<int()> ss_callback_ = nullptr;
 void register_sync_util_ss(std::function<int()> cb) {
     ss_callback_ = cb;
@@ -90,6 +96,17 @@ namespace mako
         case batchLockReqType:
             HandleBatchLockRequest(reqBuf, respBuf, respLen);
             break;
+#ifdef ENABLE_ELR
+        case earlyReleaseReqType:
+            HandleEarlyReleaseRequest(reqBuf, respBuf, respLen);
+            break;
+        case cascadeAbortReqType:
+            HandleCascadeAbortRequest(reqBuf, respBuf, respLen);
+            break;
+        case elrDependencyReqType:
+            HandleELRDependencyRequest(reqBuf, respBuf, respLen);
+            break;
+#endif
         default:
             Warning("Unrecognized rquest type: %d", reqType);
         }
@@ -543,6 +560,164 @@ namespace mako
         memcpy(resp->value, obj_v.c_str(), obj_v.length());
 #endif
     }
+
+    // =========================================================================
+    // Early Lock Release (ELR) Handlers
+    // =========================================================================
+
+#ifdef ENABLE_ELR
+    void ShardReceiver::HandleEarlyReleaseRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        using namespace mako::elr;
+        
+        auto *req = reinterpret_cast<early_release_request_t *>(reqBuf);
+        auto *resp = reinterpret_cast<early_release_response_t *>(respBuf);
+        respLen = sizeof(early_release_response_t);
+        
+        resp->req_nr = req->req_nr;
+        resp->status = ELRErrorCode::ELR_SUCCESS;
+        resp->num_released = 0;
+        
+        // Check if ELR is enabled
+        if (!elr_enabled()) {
+            resp->status = ELRErrorCode::ELR_NOT_ENABLED;
+            return;
+        }
+        
+        auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+        
+        // Check if early release is allowed for this transaction
+        if (!elr_manager.canEarlyRelease(req->txn_id)) {
+            resp->status = ELRErrorCode::ELR_CHAIN_TOO_DEEP;
+            return;
+        }
+        
+        // Parse and early-release each key
+        std::vector<ELRKey> keys;
+        char* data_ptr = req->data;
+        
+        for (uint16_t i = 0; i < req->num_keys; i++) {
+            uint16_t table_id, key_len;
+            memcpy(&table_id, data_ptr, sizeof(uint16_t));
+            data_ptr += sizeof(uint16_t);
+            memcpy(&key_len, data_ptr, sizeof(uint16_t));
+            data_ptr += sizeof(uint16_t);
+            
+            ELRKey elr_key;
+            elr_key.shard_id = TThread::get_shard_index();
+            elr_key.table_id = table_id;
+            elr_key.key.assign(data_ptr, key_len);
+            data_ptr += key_len;
+            
+            keys.push_back(elr_key);
+        }
+        
+        // Perform early release
+        auto result = elr_manager.earlyRelease(req->txn_id, keys);
+        
+        if (result.success) {
+            resp->num_released = static_cast<uint16_t>(result.released_keys.size());
+        } else {
+            resp->status = ELRErrorCode::ELR_ALREADY_RELEASED;
+        }
+    }
+
+    void ShardReceiver::HandleCascadeAbortRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        using namespace mako::elr;
+        
+        auto *req = reinterpret_cast<cascade_abort_request_t *>(reqBuf);
+        auto *resp = reinterpret_cast<cascade_abort_response_t *>(respBuf);
+        respLen = sizeof(cascade_abort_response_t);
+        
+        resp->req_nr = req->req_nr;
+        resp->status = ELRErrorCode::ELR_SUCCESS;
+        resp->num_cascaded = 0;
+        
+        // Check if ELR is enabled
+        if (!elr_enabled()) {
+            resp->status = ELRErrorCode::ELR_NOT_ENABLED;
+            return;
+        }
+        
+        auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+        
+        // Handle the cascade abort from remote shard
+        elr_manager.handleRemoteCascadeAbort(req->txn_id, req->source_shard);
+        
+        // Get the cascade set for this transaction
+        auto cascade_set = elr_manager.getCascadeAbortSet(req->txn_id);
+        resp->num_cascaded = static_cast<uint16_t>(cascade_set.size());
+        
+        // Abort the transaction locally
+        auto result = elr_manager.abortTransaction(req->txn_id);
+        
+        if (!result.success) {
+            resp->status = ELRErrorCode::ELR_CASCADE_FAILED;
+        }
+        
+        // Also abort in the database layer
+        db->shard_abort_txn(nullptr);
+    }
+
+    void ShardReceiver::HandleELRDependencyRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        using namespace mako::elr;
+        
+        auto *req = reinterpret_cast<elr_dependency_request_t *>(reqBuf);
+        auto *resp = reinterpret_cast<elr_dependency_response_t *>(respBuf);
+        respLen = sizeof(elr_dependency_response_t);
+        
+        resp->req_nr = req->req_nr;
+        resp->status = ELRErrorCode::ELR_SUCCESS;
+        resp->cycle_detected = false;
+        
+        // Check if ELR is enabled
+        if (!elr_enabled()) {
+            resp->status = ELRErrorCode::ELR_NOT_ENABLED;
+            return;
+        }
+        
+        auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+        
+        // Create the ELR key
+        ELRKey elr_key;
+        elr_key.shard_id = TThread::get_shard_index();
+        elr_key.table_id = req->table_id;
+        elr_key.key.assign(req->key, req->key_len);
+        
+        // Register the dependency
+        bool success = elr_manager.registerELRRead(
+            req->reader_txn_id, req->writer_txn_id, elr_key, 0);
+        
+        if (!success) {
+            resp->status = ELRErrorCode::ELR_CYCLE_DETECTED;
+            resp->cycle_detected = true;
+        }
+    }
+#else
+    // Stub implementations when ELR is disabled
+    void ShardReceiver::HandleEarlyReleaseRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        auto *resp = reinterpret_cast<basic_response_t *>(respBuf);
+        respLen = sizeof(basic_response_t);
+        resp->status = ErrorCode::ERROR;
+    }
+
+    void ShardReceiver::HandleCascadeAbortRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        auto *resp = reinterpret_cast<basic_response_t *>(respBuf);
+        respLen = sizeof(basic_response_t);
+        resp->status = ErrorCode::ERROR;
+    }
+
+    void ShardReceiver::HandleELRDependencyRequest(char *reqBuf, char *respBuf, size_t &respLen)
+    {
+        auto *resp = reinterpret_cast<basic_response_t *>(respBuf);
+        respLen = sizeof(basic_response_t);
+        resp->status = ErrorCode::ERROR;
+    }
+#endif // ENABLE_ELR
 
     /**
      * file: configuration fileName

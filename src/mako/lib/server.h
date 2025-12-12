@@ -14,6 +14,11 @@
 #include "benchmarks/abstract_ordered_index.h"
 #include "lib/helper_queue.h"
 
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "elr/elr_manager.h"
+#endif
+
 void register_sync_util_ss(std::function<int()>);
 
 namespace mako
@@ -54,6 +59,11 @@ namespace mako
         void HandleBatchLockMegaRequest(char *reqBuf, char *respBuf, size_t &respLen);
         void HandleGetMicroMegaRequest(char *reqBuf, char *respBuf, size_t &respLen);
         void HandleBatchLockMicroMegaRequest(char *reqBuf, char *respBuf, size_t &respLen);
+
+        // Early Lock Release (ELR) handlers
+        void HandleEarlyReleaseRequest(char *reqBuf, char *respBuf, size_t &respLen);
+        void HandleCascadeAbortRequest(char *reqBuf, char *respBuf, size_t &respLen);
+        void HandleELRDependencyRequest(char *reqBuf, char *respBuf, size_t &respLen);
 
     protected:
         inline void *txn_buf() { return (void *) txn_obj_buf.data(); }
