@@ -24,6 +24,8 @@
 
 #include "elr_common.h"
 #include "dependency_tracker.h"
+#include "elr_log.h"
+#include "cascade_abort.h"
 
 namespace mako {
 namespace elr {
@@ -303,11 +305,17 @@ public:
     
 private:
     ELRManager();
-    ~ELRManager();
     
     // Prevent copying
     ELRManager(const ELRManager&) = delete;
     ELRManager& operator=(const ELRManager&) = delete;
+    
+    // Custom deleter for unique_ptr to access private destructor
+    struct Deleter {
+        void operator()(ELRManager* ptr) const { delete ptr; }
+    };
+    friend struct Deleter;
+    ~ELRManager();
     
     // Configuration
     shardid_t shard_id_;
@@ -317,6 +325,9 @@ private:
     // Dependency tracking
     std::unique_ptr<DependencyTracker> dependency_tracker_;
     std::unique_ptr<ShardDependencyTracker> shard_dependency_tracker_;
+    
+    // Cascade abort handling
+    std::unique_ptr<CascadeAbortHandler> cascade_abort_handler_;
     
     // Active transactions with ELR
     std::unordered_map<txnid_t, std::unique_ptr<ELRTransactionInfo>> active_txns_;
@@ -336,6 +347,9 @@ private:
     std::condition_variable cleanup_cv_;
     std::mutex cleanup_mutex_;
     
+    // Per-shard ELR logs for persistence
+    std::unordered_map<shardid_t, std::unique_ptr<ELRLog>> shard_logs_;
+    
     // Helper methods
     ELRTransactionInfo* getTransactionInfo(txnid_t txn_id);
     void cleanupExpiredLocks();
@@ -343,7 +357,7 @@ private:
     uint64_t getCurrentTimeUs() const;
     
     // Singleton instances per shard
-    static std::unordered_map<shardid_t, std::unique_ptr<ELRManager>> instances_;
+    static std::unordered_map<shardid_t, std::unique_ptr<ELRManager, Deleter>> instances_;
     static std::mutex instances_mutex_;
 };
 

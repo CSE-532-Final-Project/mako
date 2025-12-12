@@ -13,7 +13,7 @@ namespace mako {
 namespace elr {
 
 // Static member initialization
-std::unordered_map<shardid_t, std::unique_ptr<ELRManager>> ELRManager::instances_;
+std::unordered_map<shardid_t, std::unique_ptr<ELRManager, ELRManager::Deleter>> ELRManager::instances_;
 std::mutex ELRManager::instances_mutex_;
 
 // ============================================================================
@@ -25,8 +25,8 @@ ELRManager& ELRManager::getInstance(shardid_t shard_id) {
     
     auto it = instances_.find(shard_id);
     if (it == instances_.end()) {
-        // Create new instance
-        instances_[shard_id] = std::unique_ptr<ELRManager>(new ELRManager());
+        // Create new instance with custom deleter
+        instances_[shard_id] = std::unique_ptr<ELRManager, Deleter>(new ELRManager(), Deleter{});
         return *instances_[shard_id];
     }
     return *it->second;
@@ -55,6 +55,18 @@ void ELRManager::initialize(shardid_t shard_id, const ELRConfig& config) {
     
     shard_dependency_tracker_ = std::make_unique<ShardDependencyTracker>(shard_id);
     
+    // Initialize cascade abort handler
+    cascade_abort_handler_ = std::make_unique<CascadeAbortHandler>(shard_id);
+    cascade_abort_handler_->setDependencyTracker(dependency_tracker_.get());
+    cascade_abort_handler_->setShardDependencyTracker(shard_dependency_tracker_.get());
+    
+    // Initialize ELR log for persistence
+    if (config_.enable_logging) {
+        auto log = std::make_unique<ELRLog>(shard_id);
+        log->initialize("");  // Empty string = memory-only logging
+        shard_logs_[shard_id] = std::move(log);
+    }
+    
     // Start cleanup thread if ELR is enabled
     if (config_.enabled) {
         running_ = true;
@@ -64,7 +76,8 @@ void ELRManager::initialize(shardid_t shard_id, const ELRConfig& config) {
     initialized_ = true;
     
     std::cerr << "[ELR] Manager initialized for shard " << shard_id
-              << " (enabled=" << config_.enabled << ")" << std::endl;
+              << " (enabled=" << config_.enabled 
+              << ", logging=" << config_.enable_logging << ")" << std::endl;
 }
 
 void ELRManager::shutdown() {
@@ -366,8 +379,23 @@ CascadeAbortResult ELRManager::abortTransaction(txnid_t txn_id) {
         }
     }
     
-    // Get cascade abort set BEFORE clearing locks
-    std::vector<txnid_t> cascade_set = getCascadeAbortSet(txn_id);
+    // Use cascade abort handler to build abort set (includes cross-shard)
+    std::vector<std::pair<txnid_t, shardid_t>> full_abort_set;
+    if (cascade_abort_handler_) {
+        full_abort_set = cascade_abort_handler_->buildAbortSet(txn_id);
+    }
+    
+    // Separate local and remote transactions
+    std::vector<txnid_t> local_cascade_set;
+    std::vector<std::pair<txnid_t, shardid_t>> remote_cascade_set;
+    
+    for (const auto& [dependent_txn, dependent_shard] : full_abort_set) {
+        if (dependent_shard == shard_id_) {
+            local_cascade_set.push_back(dependent_txn);
+        } else {
+            remote_cascade_set.push_back({dependent_txn, dependent_shard});
+        }
+    }
     
     {
         std::unique_lock<std::shared_mutex> lock(lock_mutex_);
@@ -385,12 +413,12 @@ CascadeAbortResult ELRManager::abortTransaction(txnid_t txn_id) {
     // Mark aborted in dependency tracker
     dependency_tracker_->markAborted(txn_id);
     
-    // Cascade abort to dependents
+    // Cascade abort to local dependents
     result.aborted_txns.push_back(txn_id);
     result.cascade_depth = 0;
     
-    for (txnid_t dependent_txn : cascade_set) {
-        // Recursively abort dependents
+    for (txnid_t dependent_txn : local_cascade_set) {
+        // Recursively abort local dependents
         CascadeAbortResult sub_result = abortTransaction(dependent_txn);
         
         // Merge results
@@ -400,15 +428,25 @@ CascadeAbortResult ELRManager::abortTransaction(txnid_t txn_id) {
         result.cascade_depth = std::max(result.cascade_depth, sub_result.cascade_depth + 1);
     }
     
+    // Notify remote shards about cascade abort
+    for (const auto& [remote_txn, remote_shard] : remote_cascade_set) {
+        // Use abort callback to notify remote shard
+        // The callback is set by the RPC layer to send cascade abort RPC
+        if (abort_callback_) {
+            abort_callback_(remote_txn, {remote_txn});
+        }
+    }
+    
     // Update stats
-    if (!cascade_set.empty()) {
+    size_t total_cascade = local_cascade_set.size() + remote_cascade_set.size();
+    if (total_cascade > 0) {
         getStats().cascade_aborts.fetch_add(1);
         getStats().cascade_abort_depth_sum.fetch_add(result.cascade_depth);
     }
     
-    // Invoke callback if set
-    if (abort_callback_ && !cascade_set.empty()) {
-        abort_callback_(txn_id, cascade_set);
+    // Invoke callback if set for local cascade
+    if (abort_callback_ && !local_cascade_set.empty()) {
+        abort_callback_(txn_id, local_cascade_set);
     }
     
     // Log for recovery
@@ -442,8 +480,23 @@ void ELRManager::handleRemoteCascadeAbort(txnid_t txn_id, shardid_t source_shard
 
 void ELRManager::logELROperation(txnid_t txn_id, const std::string& operation,
                                   const std::vector<ELRKey>& keys) {
-    // TODO: Integrate with RocksDB persistence or Paxos log
-    // For now, just log to stderr in debug mode
+    // Get the ELR log from the integration layer
+    // The log handles persistence via RocksDB or Paxos replication
+    
+    std::lock_guard<std::shared_mutex> lock(txn_mutex_);
+    auto it = shard_logs_.find(shard_id_);
+    if (it != shard_logs_.end() && it->second) {
+        if (operation == "EARLY_RELEASE") {
+            for (const auto& key : keys) {
+                it->second->logEarlyRelease(txn_id, key);
+            }
+        } else if (operation == "COMMIT") {
+            it->second->logCommit(txn_id);
+        } else if (operation == "ABORT") {
+            it->second->logAbort(txn_id);
+        }
+    }
+    
 #ifdef DEBUG
     std::cerr << "[ELR LOG] txn=" << txn_id << " op=" << operation
               << " keys=" << keys.size() << std::endl;
@@ -451,8 +504,57 @@ void ELRManager::logELROperation(txnid_t txn_id, const std::string& operation,
 }
 
 void ELRManager::recoverFromLog() {
-    // TODO: Implement recovery from RocksDB persistence
-    std::cerr << "[ELR] Recovery not yet implemented" << std::endl;
+    std::cerr << "[ELR] Starting recovery from log..." << std::endl;
+    
+    std::lock_guard<std::shared_mutex> lock(txn_mutex_);
+    auto it = shard_logs_.find(shard_id_);
+    if (it == shard_logs_.end() || !it->second) {
+        std::cerr << "[ELR] No log available for recovery" << std::endl;
+        return;
+    }
+    
+    ELRLog* log = it->second.get();
+    
+    // Get uncommitted transactions from the log
+    auto uncommitted = log->getUncommittedTransactions();
+    std::cerr << "[ELR] Found " << uncommitted.size() 
+              << " uncommitted transactions" << std::endl;
+    
+    // Get transactions that need cascade abort
+    auto cascade_txns = log->getCascadeAbortTransactions();
+    
+    // First, handle cascade aborts
+    for (txnid_t txn_id : cascade_txns) {
+        std::cerr << "[ELR] Recovery: cascade aborting txn " << txn_id << std::endl;
+        dependency_tracker_->markAborted(txn_id);
+    }
+    
+    // For remaining uncommitted transactions that weren't cascade-aborted,
+    // we need to check their dependencies
+    for (txnid_t txn_id : uncommitted) {
+        // Skip if already handled as cascade abort
+        if (std::find(cascade_txns.begin(), cascade_txns.end(), txn_id) != cascade_txns.end()) {
+            continue;
+        }
+        
+        // Check if any dependency aborted - if so, this must abort too
+        auto deps = dependency_tracker_->getDependencies(txn_id);
+        bool must_abort = false;
+        for (txnid_t dep : deps) {
+            if (std::find(cascade_txns.begin(), cascade_txns.end(), dep) != cascade_txns.end()) {
+                must_abort = true;
+                break;
+            }
+        }
+        
+        if (must_abort) {
+            std::cerr << "[ELR] Recovery: aborting dependent txn " << txn_id << std::endl;
+            dependency_tracker_->markAborted(txn_id);
+            log->logAbort(txn_id);
+        }
+    }
+    
+    std::cerr << "[ELR] Recovery complete" << std::endl;
 }
 
 // ============================================================================

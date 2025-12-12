@@ -411,6 +411,21 @@ ShardDependencyTracker::getCrossShardDependencies(txnid_t txn_id) {
     return it->second;
 }
 
+std::vector<std::pair<txnid_t, shardid_t>>
+ShardDependencyTracker::getRemoteDependents(txnid_t local_txn) {
+    std::lock_guard<std::mutex> lock(cross_shard_mutex_);
+    auto it = remote_dependents_.find(local_txn);
+    if (it == remote_dependents_.end()) return {};
+    return it->second;
+}
+
+void ShardDependencyTracker::addRemoteDependent(txnid_t local_txn,
+                                                 txnid_t remote_txn,
+                                                 shardid_t remote_shard) {
+    std::lock_guard<std::mutex> lock(cross_shard_mutex_);
+    remote_dependents_[local_txn].push_back({remote_txn, remote_shard});
+}
+
 void ShardDependencyTracker::notifyRemoteCommit(txnid_t remote_txn,
                                                  shardid_t remote_shard) {
     std::lock_guard<std::mutex> lock(cross_shard_mutex_);

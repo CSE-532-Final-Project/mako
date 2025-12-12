@@ -226,7 +226,7 @@ private:
     
     // Transaction state (for recovery)
     std::unordered_map<txnid_t, std::vector<ELRLogRecord>> txn_logs_;
-    std::mutex txn_logs_mutex_;
+    mutable std::mutex txn_logs_mutex_;
     
     // Helper methods
     uint64_t appendRecord(const ELRLogRecord& record);

@@ -185,6 +185,17 @@ public:
 private:
     shardid_t shard_id_;
     DependencyTracker* dependency_tracker_;
+    ShardDependencyTracker* shard_dependency_tracker_;
+    
+public:
+    /**
+     * @brief Set the shard dependency tracker for cross-shard handling
+     */
+    void setShardDependencyTracker(ShardDependencyTracker* tracker) {
+        shard_dependency_tracker_ = tracker;
+    }
+    
+private:
     
     // Active cascade operations
     std::unordered_map<uint64_t, std::unique_ptr<CascadeAbortOperation>> active_cascades_;
@@ -204,15 +215,18 @@ private:
     // Statistics
     Stats stats_;
     
-    // Helper methods
-    
+public:
     /**
      * @brief Build the abort set in topological order
      *
      * Returns transactions in reverse topological order (leaves first)
      * so that dependent transactions are aborted before their dependencies.
+     * Includes both local and cross-shard dependent transactions.
      */
     std::vector<std::pair<txnid_t, shardid_t>> buildAbortSet(txnid_t root_txn);
+    
+private:
+    // Helper methods
     
     /**
      * @brief Execute a single abort

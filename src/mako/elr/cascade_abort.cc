@@ -8,12 +8,13 @@
 #include <queue>
 #include <chrono>
 #include <iostream>
+#include <thread>
 
 namespace mako {
 namespace elr {
 
 CascadeAbortHandler::CascadeAbortHandler(shardid_t shard_id)
-    : shard_id_(shard_id), dependency_tracker_(nullptr) {}
+    : shard_id_(shard_id), dependency_tracker_(nullptr), shard_dependency_tracker_(nullptr) {}
 
 CascadeAbortHandler::~CascadeAbortHandler() {}
 
@@ -30,16 +31,37 @@ CascadeAbortHandler::buildAbortSet(txnid_t root_txn) {
         return result;
     }
     
-    // Get all transactions that need to be aborted
-    std::vector<txnid_t> cascade_set = dependency_tracker_->getCascadeAbortSet(root_txn, 0);
+    // Get all local transactions that need to be aborted
+    std::vector<txnid_t> local_cascade_set = dependency_tracker_->getCascadeAbortSet(root_txn, 0);
     
-    // For now, assume all transactions are on the local shard
-    // TODO: Integrate with shard dependency tracker for cross-shard
-    for (txnid_t txn : cascade_set) {
+    // Add local transactions
+    for (txnid_t txn : local_cascade_set) {
         result.push_back({txn, shard_id_});
     }
     
-    // Reverse to get leaves first (for correct abort ordering)
+    // Handle cross-shard dependencies
+    // For each local transaction in the cascade set, check if it has
+    // remote dependents (remote transactions that read local uncommitted data)
+    if (shard_dependency_tracker_) {
+        for (txnid_t local_txn : local_cascade_set) {
+            // Get remote transactions that depend on this local transaction
+            // (they read our uncommitted writes and need to abort if we abort)
+            auto remote_deps = shard_dependency_tracker_->getRemoteDependents(local_txn);
+            for (const auto& [remote_txn, remote_shard] : remote_deps) {
+                // Add remote transaction to abort set (will be handled via RPC)
+                result.push_back({remote_txn, remote_shard});
+            }
+        }
+    }
+    
+    // Sort by shard to group remote calls, then reverse within each group
+    // to abort leaves first
+    std::stable_sort(result.begin(), result.end(),
+        [](const auto& a, const auto& b) {
+            return a.second < b.second;  // Group by shard
+        });
+    
+    // Reverse to get leaves first (for correct abort ordering within each shard)
     std::reverse(result.begin(), result.end());
     
     return result;

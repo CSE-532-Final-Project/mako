@@ -344,7 +344,7 @@ void ELRIntegration::onPaxosFollowerReplay(shardid_t shard_id, const std::string
 // Statistics and Debugging
 // ============================================================================
 
-ELRStats ELRIntegration::getStats(shardid_t shard_id) const {
+const ELRStats& ELRIntegration::getStats(shardid_t shard_id) const {
     return ELRConfigManager::getInstance().getStats();
 }
 

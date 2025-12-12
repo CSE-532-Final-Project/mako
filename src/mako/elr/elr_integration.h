@@ -217,7 +217,7 @@ public:
     /**
      * @brief Get statistics for a shard
      */
-    ELRStats getStats(shardid_t shard_id) const;
+    const ELRStats& getStats(shardid_t shard_id) const;
     
     /**
      * @brief Get overall statistics

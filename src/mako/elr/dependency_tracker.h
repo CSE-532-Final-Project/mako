@@ -247,9 +247,21 @@ public:
                                   shardid_t remote_shard);
     
     /**
-     * @brief Get cross-shard dependencies for a transaction
+     * @brief Get cross-shard dependencies for a transaction (what it depends on)
      */
     std::vector<std::pair<txnid_t, shardid_t>> getCrossShardDependencies(txnid_t txn_id);
+    
+    /**
+     * @brief Get remote transactions that depend on a local transaction
+     * Used for cascade aborts - when local_txn aborts, these remote transactions
+     * must also be notified to abort.
+     */
+    std::vector<std::pair<txnid_t, shardid_t>> getRemoteDependents(txnid_t local_txn);
+    
+    /**
+     * @brief Register that a remote transaction depends on a local transaction
+     */
+    void addRemoteDependent(txnid_t local_txn, txnid_t remote_txn, shardid_t remote_shard);
     
     /**
      * @brief Notify that a remote transaction committed
@@ -266,7 +278,14 @@ private:
     DependencyTracker local_tracker_;
     
     // Cross-shard dependencies: local_txn -> [(remote_txn, remote_shard)]
+    // These are transactions that local_txn depends on (the local reads uncommitted remote data)
     std::unordered_map<txnid_t, std::vector<std::pair<txnid_t, shardid_t>>> cross_shard_deps_;
+    
+    // Remote dependents: local_txn -> [(remote_txn, remote_shard)]
+    // These are remote transactions that depend on local_txn (remote reads uncommitted local data)
+    // Used for cascade aborts
+    std::unordered_map<txnid_t, std::vector<std::pair<txnid_t, shardid_t>>> remote_dependents_;
+    
     std::mutex cross_shard_mutex_;
 };
 
