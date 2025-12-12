@@ -7,6 +7,7 @@
 #include <sstream>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 
 namespace mako {
 namespace elr {
@@ -240,34 +241,34 @@ std::vector<txnid_t> DependencyTracker::getCascadeAbortSet(txnid_t txn_id, uint3
     
     std::vector<txnid_t> result;
     std::unordered_set<txnid_t> visited;
-    std::queue<std::pair<txnid_t, uint32_t>> queue; // (txn_id, depth)
     
     // Start with all direct dependents
     DependencyNode* start_node = getNode(txn_id);
     if (!start_node) return result;
     
-    for (txnid_t dependent : start_node->depended_by) {
-        queue.push({dependent, 1});
-    }
-    
-    while (!queue.empty()) {
-        auto [current, depth] = queue.front();
-        queue.pop();
-        
-        if (visited.count(current) > 0) continue;
-        if (max_depth > 0 && depth > max_depth) continue;
+    // Use DFS with post-order traversal to get leaves first
+    // This ensures that if A depends on B, A comes before B in result
+    std::function<void(txnid_t, uint32_t)> dfs = [&](txnid_t current, uint32_t depth) {
+        if (visited.count(current) > 0) return;
+        if (max_depth > 0 && depth > max_depth) return;
         
         visited.insert(current);
-        result.push_back(current);
         
         DependencyNode* node = getNode(current);
         if (node) {
+            // First recurse into dependents (children in cascade tree)
             for (txnid_t dependent : node->depended_by) {
-                if (visited.count(dependent) == 0) {
-                    queue.push({dependent, depth + 1});
-                }
+                dfs(dependent, depth + 1);
             }
         }
+        
+        // Add to result after processing all dependents (post-order)
+        result.push_back(current);
+    };
+    
+    // Start DFS from all direct dependents
+    for (txnid_t dependent : start_node->depended_by) {
+        dfs(dependent, 1);
     }
     
     return result;
