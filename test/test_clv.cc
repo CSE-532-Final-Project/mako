@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 #include "deptran/2pl/tx.h"
 #include "deptran/config.h"
 #include "memdb/row.h"
+#include "rrr/reactor/coroutine.h"
 
 using namespace janus;
 
@@ -257,7 +259,15 @@ TEST(ControlledLockViolation, Scheduler2plViolatesCommitPhaseLocks) {
   auto tx1 = std::make_shared<Tx2pl>(0, 1, &sched);
   auto tx2 = std::make_shared<Tx2pl>(0, 2, &sched);
 
-  ASSERT_TRUE(sched.Guard(*tx1, row, 0, true));
+  auto run_guard = [&](const std::shared_ptr<Tx2pl>& tx) {
+    bool ok = false;
+    rrr::Coroutine::CreateRun([&]() {
+      ok = sched.Guard(*tx, row, 0, true);
+    });
+    return ok;
+  };
+
+  ASSERT_TRUE(run_guard(tx1));
   EXPECT_EQ(tx1->locked_locks_.size(), 1u);
 
   uint64_t staged_lsn = 123;
@@ -305,4 +315,147 @@ TEST(ControlledLockViolation, Scheduler2plAbortCascadesToViolators) {
   sched.CascadeAbort(*tx1);
   ASSERT_FALSE(sched.aborted.empty());
   EXPECT_NE(std::find(sched.aborted.begin(), sched.aborted.end(), tx2->tid_), sched.aborted.end());
+}
+
+TEST(ControlledLockViolation, Scheduler2plTracksMultipleViolators) {
+  EnsureConfig();
+  Scheduler2pl sched;
+  mdb::FineLockedRow::set_wound_wait();
+
+  mdb::Schema schema;
+  schema.add_column("v", Value::I32);
+  std::vector<mdb::Value> row_data(1);
+  row_data[0].set_i32(0);
+  auto row = mdb::FineLockedRow::create(&schema, row_data);
+
+  auto tx1 = std::make_shared<Tx2pl>(0, 30, &sched);
+  auto tx2 = std::make_shared<Tx2pl>(0, 31, &sched);
+  auto tx3 = std::make_shared<Tx2pl>(0, 32, &sched);
+
+  auto run_guard = [&](const std::shared_ptr<Tx2pl>& tx) {
+    bool ok = false;
+    rrr::Coroutine::CreateRun([&]() {
+      ok = sched.Guard(*tx, row, 0, true);
+    });
+    return ok;
+  };
+
+  ASSERT_TRUE(run_guard(tx1));
+  EXPECT_EQ(tx1->locked_locks_.size(), 1u);
+
+  uint64_t staged_lsn = 777;
+  tx1->MarkCommitRecordStaged(staged_lsn);
+
+  ASSERT_TRUE(run_guard(tx2));
+  EXPECT_EQ(tx2->required_commit_lsn(), staged_lsn);
+  uint64_t staged_lsn2 = staged_lsn + 5;
+  tx2->MarkCommitRecordStaged(staged_lsn2);
+
+  ASSERT_TRUE(run_guard(tx3));
+
+  EXPECT_TRUE(tx2->locked_locks_.empty());
+  EXPECT_TRUE(tx3->locked_locks_.empty());
+  ASSERT_EQ(tx2->violated_locks_.size(), 1u);
+  ASSERT_EQ(tx3->violated_locks_.size(), 1u);
+  EXPECT_EQ(tx2->required_commit_lsn(), staged_lsn);
+  EXPECT_EQ(tx3->required_commit_lsn(), staged_lsn2);
+
+  auto dependents = tx1->TakeDependents();
+  ASSERT_EQ(dependents.size(), 2u);
+  std::vector<txnid_t> ids;
+  ids.reserve(dependents.size());
+  for (auto &dep : dependents) {
+    ids.push_back(dep->tid_);
+  }
+  EXPECT_NE(std::find(ids.begin(), ids.end(), tx2->tid_), ids.end());
+  EXPECT_NE(std::find(ids.begin(), ids.end(), tx3->tid_), ids.end());
+
+  auto tx2_dependents = tx2->TakeDependents();
+  ASSERT_EQ(tx2_dependents.size(), 1u);
+  EXPECT_EQ(tx2_dependents[0], tx3);
+}
+
+TEST(ControlledLockViolation, Scheduler2plDoesNotViolateActiveLocks) {
+  EnsureConfig();
+  Scheduler2pl sched;
+  mdb::FineLockedRow::set_wound_wait();
+
+  mdb::Schema schema;
+  schema.add_column("v", Value::I32);
+  std::vector<mdb::Value> row_data(1);
+  row_data[0].set_i32(0);
+  auto row = mdb::FineLockedRow::create(&schema, row_data);
+
+  auto tx1 = std::make_shared<Tx2pl>(0, 20, &sched);
+  auto tx2 = std::make_shared<Tx2pl>(0, 21, &sched);
+
+  ASSERT_TRUE(sched.Guard(*tx1, row, 0, true));
+  EXPECT_EQ(tx1->locked_locks_.size(), 1u);
+
+  auto guard_future = std::async(std::launch::async, [&]() {
+    bool acquired = false;
+    rrr::Coroutine::CreateRun([&]() {
+      acquired = sched.Guard(*tx2, row, 0, true);
+    });
+    return acquired;
+  });
+
+  EXPECT_EQ(guard_future.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::ready);
+  EXPECT_FALSE(guard_future.get());
+  EXPECT_TRUE(tx2->locked_locks_.empty());
+  EXPECT_TRUE(tx2->violated_locks_.empty());
+
+  tx1->MarkCommitRecordStaged(999);
+  auto tx3 = std::make_shared<Tx2pl>(0, 22, &sched);
+  bool violated = false;
+  rrr::Coroutine::CreateRun([&]() {
+    violated = sched.Guard(*tx3, row, 0, true);
+  });
+  EXPECT_TRUE(violated);
+  EXPECT_TRUE(tx3->locked_locks_.empty());
+  EXPECT_EQ(tx3->violated_locks_.size(), 1u);
+
+  auto dependents = tx1->TakeDependents();
+  ASSERT_EQ(dependents.size(), 1u);
+  EXPECT_EQ(dependents[0], tx3);
+  EXPECT_EQ(tx3->required_commit_lsn(), tx1->commit_lsn());
+}
+
+TEST(ControlledLockViolation, ViolatorsWaitForDurability) {
+  EnsureConfig();
+  Scheduler2pl sched;
+  mdb::FineLockedRow::set_wound_wait();
+
+  mdb::Schema schema;
+  schema.add_column("v", Value::I32);
+  std::vector<mdb::Value> row_data(1);
+  row_data[0].set_i32(0);
+  auto row = mdb::FineLockedRow::create(&schema, row_data);
+
+  auto tx1 = std::make_shared<Tx2pl>(0, 40, &sched);
+  auto tx2 = std::make_shared<Tx2pl>(0, 41, &sched);
+
+  ASSERT_TRUE(sched.Guard(*tx1, row, 0, true));
+  uint64_t staged_lsn = 900;
+  tx1->MarkCommitRecordStaged(staged_lsn);
+  ASSERT_TRUE(sched.Guard(*tx2, row, 0, true));
+  EXPECT_EQ(tx2->required_commit_lsn(), staged_lsn);
+
+  std::atomic<bool> finished{false};
+  std::thread waiter([&]() {
+    sched.WaitForCommitDependencies(tx2);
+    finished.store(true);
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_FALSE(finished.load());
+
+  sched.AdvanceDurableLsn(staged_lsn - 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_FALSE(finished.load());
+
+  sched.AdvanceDurableLsn(staged_lsn);
+  waiter.join();
+  EXPECT_TRUE(finished.load());
 }
