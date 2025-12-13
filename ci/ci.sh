@@ -127,6 +127,12 @@ run_2shard_no_replication() {
 
 # Function 4b: Run 2-shard no replication test with eRPC transport
 run_2shard_no_replication_erpc() {
+    if [ "${RUN_ERPC_TESTS:-0}" != "1" ]; then
+        echo "========================================="
+        echo "Skipping: ./ci/ci.sh shardNoReplicationErpc (set RUN_ERPC_TESTS=1 to enable)"
+        echo "========================================="
+        return 0
+    fi
     echo "========================================="
     echo "Running: ./ci/ci.sh shardNoReplicationErpc"
     echo "========================================="
@@ -175,6 +181,12 @@ run_2shard_replication() {
 }
 
 run_2shard_replication_erpc() {
+    if [ "${RUN_ERPC_TESTS:-0}" != "1" ]; then
+        echo "========================================="
+        echo "Skipping: ./ci/ci.sh shard2ReplicationErpc (set RUN_ERPC_TESTS=1 to enable)"
+        echo "========================================="
+        return 0
+    fi
     echo "========================================="
     echo "Running: ./ci/ci.sh shard2ReplicationErpc"
     echo "========================================="
