@@ -19,7 +19,7 @@ sleep 1
 
 # Start shard 0 in background
 echo "Starting shard 0..."
-trd=6
+trd=3
 nohup ./build/simpleTransactionRep 2 0 $trd localhost 0 > simple-shard0-localhost.log 2>&1 &
 SHARD0_PID=$!
 

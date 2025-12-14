@@ -9,7 +9,7 @@ echo "========================================="
 echo "Testing 1-shard setup without replication"
 echo "========================================="
 
-trd=${1:-6}
+trd=${1:-3}
 script_name="$(basename "$0")"
 
 # Clean up old log files

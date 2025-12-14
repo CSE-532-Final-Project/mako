@@ -12,7 +12,7 @@ rm -f simple-shard0*.log nfs_sync_*
 USERNAME=${USER:-unknown}
 rm -rf /tmp/${USERNAME}_mako_rocksdb_shard*
 
-trd=${1:-2}
+trd=${1:-3}
 
 # Start shard 0 in background - capture ALL PIDs
 echo "Starting shard 0..."

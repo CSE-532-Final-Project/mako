@@ -22,7 +22,7 @@ rm -f nfs_sync_*
 USERNAME=${USER:-unknown}
 rm -rf /tmp/${USERNAME}_mako_rocksdb_shard*
 
-trd=${1:-2}
+trd=${1:-3}
 script_name="$(basename "$0")"
 
 # Determine transport type and create unique log prefix

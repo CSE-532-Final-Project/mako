@@ -17,7 +17,7 @@ ps aux | grep -i dbtest | awk "{print \$2}" | xargs kill -9 2>/dev/null
 ps aux | grep -i simpleTransactionRep | awk "{print \$2}" | xargs kill -9 2>/dev/null
 sleep 1
 
-trd=${1:-2}
+trd=${1:-3}
 
 # Start BOTH shards simultaneously to avoid timing issues where shard 0 tries
 # to connect to shard 1 before shard 1 is ready
