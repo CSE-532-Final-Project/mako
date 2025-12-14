@@ -320,7 +320,6 @@ private:
         void operator()(ELRManager* ptr) const { delete ptr; }
     };
     friend struct Deleter;
-    ~ELRManager();
     
     // Configuration
     shardid_t shard_id_;
