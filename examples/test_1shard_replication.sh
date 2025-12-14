@@ -10,7 +10,7 @@ echo "========================================="
 echo "Testing 1-shard setup with replication"
 echo "========================================="
 
-trd=${1:-6}
+trd=${1:-2}
 script_name="$(basename "$0")"
 ps aux | grep -i dbtest | awk "{print \$2}" | xargs kill -9 2>/dev/null
 # Clean up old log files
