@@ -104,29 +104,32 @@ make -j32
 
 | Target | Command | Description |
 |--------|---------|-------------|
-| **Mako + Paxos** | `make -j32` | Default build with Paxos replication (also builds `deptran_server`) |
-| **Mako + Raft** | `make mako-raft -j64` | Mako with Raft as replication layer (also builds `deptran_server`) |
-| **Raft Lab Tests** | `make raft-test -j32` | Raft coroutine lab tests only (breaks normal configs) |
+| **Mako + Paxos** | `make -j32` | Default build with Paxos replication (~2-3 mins) |
+| **Mako + Raft** | `make mako-raft -j32` | Mako with Raft replication (builds `deptran_server` and Raft test binaries) |
+| **Raft Lab Tests** | `make raft-test -j32` | Raft with testing coroutines (only for `raft_lab_test.yml`) |
 | **Clean** | `make clean` | Remove all build artifacts |
 | **Help** | `make help` | Show all available targets |
 
 ### Output Binaries
 
-| Binary | Description |
-|--------|-------------|
-| `build/dbtest` | Main Mako binary (works with both Paxos and Raft replication) |
-| `build/deptran_server` | Standalone Raft server (for Raft-only testing without Mako) |
-| `build/simpleRaft` | Simple Raft replication test |
-| `build/simpleTransactionRepRaft` | Raft-based transaction replication test |
+| Binary | Build | Description |
+|--------|-------|-------------|
+| `build/dbtest` | all | Main Mako binary (works with both Paxos and Raft replication) |
+| `build/deptran_server` | mako-raft | Standalone Raft server (for Raft-only testing) |
+| `build/simpleRaft` | mako-raft | Simple Raft replication test |
+| `build/simpleTransactionRepRaft` | mako-raft | Raft-based transaction replication test |
+| `build/testPreferredReplicaStartup` | mako-raft | Raft preferred replica startup test |
+| `build/testPreferredReplicaLogReplication` | mako-raft | Raft log replication test |
+| `build/testNoOps` | mako-raft | Raft no-op test |
 
 ### CMake Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `MAKO_USE_RAFT` | `OFF` | Enable Raft as Mako's replication layer |
-| `RAFT_TEST` | `OFF` | Enable standalone Raft testing (no Mako) |
-| `PAXOS_LIB_ENABLED` | `1` | Build Paxos components |
-| `SHARDS` | `3` | Default shard count |
+| `MAKO_USE_RAFT` | `OFF` | Use `raft_main_helper.cc`, build Raft executables, define `MAKO_USE_RAFT=1` |
+| `RAFT_TEST` | `OFF` | Define `RAFT_TEST_CORO=1` and `REUSE_CORO=1` for lab test coroutines |
+| `ENABLE_BORROW_CHECKING` | `OFF` | Enable RustyCpp borrow checking |
+| `DEBUG` | `OFF` | Enable debug mode with `-DDEBUG` flag |
 
 ---
 

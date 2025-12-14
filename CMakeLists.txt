@@ -8,9 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(mako)
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Prefer shared libraries when available
+# Prefer shared libraries when available (needed for txlog.so linking)
 set(BUILD_SHARED_LIBS ON)
 
 # Set C++ standard
@@ -46,7 +44,7 @@ endif()
 
 # Enable borrow checking (can be disabled with -DENABLE_BORROW_CHECKING=OFF)
 # Force ON here so the checker runs unless explicitly turned off
-option(ENABLE_BORROW_CHECKING "Enable RustyCpp borrow checking" ON)
+set(ENABLE_BORROW_CHECKING ON CACHE BOOL "Enable RustyCpp borrow checking" FORCE)
 if(ENABLE_BORROW_CHECKING)
     enable_borrow_checking()
 endif()
@@ -57,7 +55,7 @@ pkg_check_modules(DPDK REQUIRED libdpdk)
 # Find Python for txlog library
 find_package(Python3 COMPONENTS Development REQUIRED)
 
-# Find Boost libraries for txlog library (prefer shared libs)
+# Find Boost libraries for txlog library (use shared libs for linking into shared txlog)
 set(Boost_USE_STATIC_LIBS OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)
 set(Boost_USE_MULTITHREADED ON)
@@ -204,12 +202,19 @@ set(ERPC_LDFLAGS_ETH
 option(DEBUG "Enable debug mode" OFF)
 option(CHECK_INVARIANTS "Enable invariant checking" OFF)
 option(COCO "Enable COCO" OFF)
-option(RAFT_TEST "Enable Raft lab testing coroutine" OFF)
 option(MAKO_USE_RAFT "Build Mako with the Raft replication helper" OFF)
+option(RAFT_TEST "Enable Raft lab testing coroutine" OFF)
 
 if(MAKO_USE_RAFT)
   add_compile_definitions(MAKO_USE_RAFT=1)
+  message(STATUS "Mako Raft replication enabled")
 endif()
+
+if(RAFT_TEST)
+  add_compile_definitions(RAFT_TEST_CORO=1)
+  message(STATUS "Raft lab testing coroutine enabled (note: REUSE_CORO is always enabled)")
+endif()
+
 set(USE_MALLOC_MODE 1 CACHE STRING "Malloc mode: 0=libc, 1=jemalloc, 2=tcmalloc, 3=flow")
 set(MODE "perf" CACHE STRING "Build mode: perf, backoff, factor-gc, factor-gc-nowriteinplace, factor-fake-compression, sandbox")
 option(STO_RMW "Enable STO read-modify-write" OFF)
@@ -665,28 +670,24 @@ file(GLOB_RECURSE DEPTRAN_SRC
 list(FILTER DEPTRAN_SRC EXCLUDE REGEX "src/deptran/s_main.cc")
 list(FILTER DEPTRAN_SRC EXCLUDE REGEX "src/deptran/paxos_main_helper.cc")
 list(FILTER DEPTRAN_SRC EXCLUDE REGEX "src/deptran/raft_main_helper.cc")
-# Ensure helper sources are removed regardless of path format
-list(REMOVE_ITEM DEPTRAN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/deptran/paxos_main_helper.cc")
-list(REMOVE_ITEM DEPTRAN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/deptran/raft_main_helper.cc")
 list(FILTER DEPTRAN_SRC EXCLUDE REGEX "src/bench/paxos_lib/.*")
 # Exclude MongoDB backend (requires mongocxx library)
 list(FILTER DEPTRAN_SRC EXCLUDE REGEX "src/deptran/mongodb/.*")
 
-# Build libtxlog as a shared library
+# Choose helper source based on MAKO_USE_RAFT
 if(MAKO_USE_RAFT)
   set(TXLOG_HELPER_SRC src/deptran/raft_main_helper.cc)
 else()
   set(TXLOG_HELPER_SRC src/deptran/paxos_main_helper.cc)
 endif()
 
+# Build libtxlog as a shared library
 add_library(txlog SHARED
     ${TXLOG_HELPER_SRC}
     ${DEPTRAN_SRC}
     ${RRR_SRC}
     ${MEMDB_SRC}
 )
-
-# set_target_properties(txlog PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Add dependency to ensure rcc_rpc.h is generated before txlog is built
 add_dependencies(txlog rcc_rpc_gen)
@@ -706,7 +707,7 @@ target_include_directories(txlog PRIVATE
 target_compile_options(txlog PRIVATE ${BENCH_CXXFLAGS})
 target_compile_definitions(txlog PRIVATE CONFIG_H=\"${CONFIG_H}\")
 
-target_link_libraries(txlog PUBLIC
+target_link_libraries(txlog
     yaml-cpp
     Boost::system
     Boost::filesystem
@@ -882,10 +883,9 @@ function(add_apps exec_name exec_path)
       ${CMAKE_CURRENT_SOURCE_DIR}/third-party/erpc/src
       ${CMAKE_CURRENT_SOURCE_DIR}/third-party/erpc/third_party/asio/include
       ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/rrr
       ${CMAKE_CURRENT_SOURCE_DIR}/src/deptran
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/rrr
       ${CMAKE_CURRENT_SOURCE_DIR}
-      ${CMAKE_CURRENT_SOURCE_DIR}/third-party/rusty-cpp/include
   )
 
   target_compile_options(${exec_name} PRIVATE ${BENCH_CXXFLAGS}) # include all flags
@@ -921,22 +921,22 @@ add_apps(simpleTransaction examples/simpleTransaction.cc)
 add_apps(simpleTransactionRep examples/simpleTransactionRep.cc)
 add_apps(continuousTransactions examples/continuousTransactions.cc)
 add_apps(simplePaxos examples/simplePaxos.cc)
-
-# Only build Raft test executables when MAKO_USE_RAFT is enabled
-if(MAKO_USE_RAFT)
-  add_apps(simpleRaft examples/mako-raft-tests/simpleRaft.cc)
-  add_apps(simpleTransactionRepRaft examples/mako-raft-tests/simpleTransactionRepRaft.cc)
-  add_apps(testPreferredReplicaStartup examples/mako-raft-tests/testPreferredReplicaStartup.cc)
-  add_apps(testPreferredReplicaLogReplication examples/mako-raft-tests/testPreferredReplicaLogReplication.cc)
-  add_apps(testNoOps examples/mako-raft-tests/testNoOps.cc)
-  add_apps(deptran_server src/deptran/s_main.cc)
-endif()
 add_apps(test_rocksdb_persistence examples/test_rocksdb_persistence.cc)
 add_apps(rocksdb_replay_app src/mako/benchmarks/rocksdb_replay_app.cc)
 add_apps(test_callback_demo examples/test_callback_demo.cc)
 add_apps(test_ordered_callbacks examples/test_ordered_callbacks.cc)
 add_apps(test_partitioned_queues examples/test_partitioned_queues.cc)
 add_apps(test_stress_partitioned_queues examples/test_stress_partitioned_queues.cc)
+
+# Raft test executables (only when MAKO_USE_RAFT is enabled)
+if(MAKO_USE_RAFT)
+  add_apps(deptran_server src/deptran/s_main.cc)
+  add_apps(simpleRaft examples/mako-raft-tests/simpleRaft.cc)
+  add_apps(simpleTransactionRepRaft examples/mako-raft-tests/simpleTransactionRepRaft.cc)
+  add_apps(testPreferredReplicaStartup examples/mako-raft-tests/testPreferredReplicaStartup.cc)
+  add_apps(testPreferredReplicaLogReplication examples/mako-raft-tests/testPreferredReplicaLogReplication.cc)
+  add_apps(testNoOps examples/mako-raft-tests/testNoOps.cc)
+endif()
 
 # Borrow checking for dbtest DISABLED - uses STO (Software Transactional Objects)
 # headers which have reference-returning functions (back(), key()) that would
@@ -951,7 +951,7 @@ add_apps(basic src/mako/benchmarks/ut/basic.cc)
 add_apps(erpc_client src/mako/benchmarks/ut/erpc_client.cc)
 add_apps(erpc_server src/mako/benchmarks/ut/erpc_server.cc)
 
-# RPC benchmark binary (re-enabled after RustyCpp API updates)
+# RPC benchmark binary
 add_executable(rpcbench test/rpcbench.cc test/benchmark_service.cc)
 target_include_directories(rpcbench PRIVATE
     src
