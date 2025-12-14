@@ -306,6 +306,11 @@ public:
 private:
     ELRManager();
     
+public:
+    // Destructor needs to be public for unique_ptr
+    ~ELRManager();
+    
+private:
     // Prevent copying
     ELRManager(const ELRManager&) = delete;
     ELRManager& operator=(const ELRManager&) = delete;

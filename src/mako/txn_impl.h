@@ -7,6 +7,7 @@
 // Early Lock Release support
 #ifdef ENABLE_ELR
 #include "elr/elr_integration.h"
+#include "benchmarks/sto/Interface.hh"
 #endif
 
 // base definitions
