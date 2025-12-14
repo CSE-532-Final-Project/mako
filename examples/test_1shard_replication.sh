@@ -31,7 +31,8 @@ sleep 2
 # Wait for benchmark to complete (poll for completion marker)
 echo "Waiting for benchmark to complete..."
 log_file="${script_name}_shard0-localhost-$trd.log"
-max_wait=120  # Maximum wait time in seconds
+# Allow overriding wait timeout via SHARD_BENCHMARK_TIMEOUT (seconds)
+max_wait="${SHARD_BENCHMARK_TIMEOUT:-240}"
 wait_count=0
 
 while [ $wait_count -lt $max_wait ]; do
