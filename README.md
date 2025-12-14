@@ -260,6 +260,25 @@ make -j32
 tail -f leader.log p1.log p2.log
 ```
 
+### One-Command Local TPC-C Run
+
+To avoid juggling multiple terminals you can run the same 1-leader + 2-follower
+setup with a helper script:
+
+```bash
+# Default: 6 threads, 6 warehouses, 30s runtime
+./scripts/run_local_tpcc.sh
+
+# Override settings 
+./scripts/run_local_tpcc.sh --threads 4 --scale 1
+```
+
+The script ensures `build/dbtest` is present, launches both follower replicas in
+the background, streams the leader output to `logs/local_tpcc/leader.log`, and
+cleans up the background processes when the run completes. Extra `dbtest`
+arguments can be appended after `--`, e.g. pass `-- --workload-mix 45,44,4,4,3`
+or change runtime via `-- --runtime 45`.
+
 ---
 
 ## Running Mako with Raft
