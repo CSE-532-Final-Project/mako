@@ -25,25 +25,96 @@ log_prefix="${script_name}_${transport}"
 
 ps aux | grep -i dbtest | awk "{print \$2}" | xargs kill -9 2>/dev/null
 sleep 1
-# Start shard 0 in background
+
+# Start both shards close together so they finish around the same time.
+# This prevents race conditions where one shard is still sending RPCs
+# while the other is shutting down.
 echo "Starting shard 0..."
 nohup bash bash/shard.sh 2 0 $trd localhost > ${log_prefix}_shard0-$trd.log 2>&1 &
 SHARD0_PID=$!
-sleep 5
 
-# Start shard 1 in background (delayed start ensures shard1 stays running while shard0 shuts down)
 echo "Starting shard 1..."
 nohup bash bash/shard.sh 2 1 $trd localhost > ${log_prefix}_shard1-$trd.log 2>&1 &
 SHARD1_PID=$!
 
-# Wait for experiments to run
-echo "Running experiments for 30 seconds..."
-sleep 50
+# Brief delay for both shards to initialize before they start communicating
+sleep 2
 
-# Kill the processes
-echo "Stopping shards..."
-kill $SHARD0_PID $SHARD1_PID 2>/dev/null
-wait $SHARD0_PID $SHARD1_PID 2>/dev/null
+# Wait for benchmarks to complete (poll for completion markers)
+echo "Waiting for benchmarks to complete..."
+log_file0="${log_prefix}_shard0-$trd.log"
+log_file1="${log_prefix}_shard1-$trd.log"
+max_wait=120  # Maximum wait time in seconds
+wait_count=0
+
+while [ $wait_count -lt $max_wait ]; do
+    shard0_done=0
+    shard1_done=0
+
+    # Check if throughput output appeared for each shard
+    if [ -f "$log_file0" ] && grep -q "agg_persist_throughput" "$log_file0" 2>/dev/null; then
+        shard0_done=1
+    fi
+    if [ -f "$log_file1" ] && grep -q "agg_persist_throughput" "$log_file1" 2>/dev/null; then
+        shard1_done=1
+    fi
+
+    if [ $shard0_done -eq 1 ] && [ $shard1_done -eq 1 ]; then
+        echo "Both benchmarks completed after ${wait_count}s"
+        sleep 2  # Give a moment for final output
+        break
+    fi
+
+    sleep 1
+    wait_count=$((wait_count + 1))
+    if [ $((wait_count % 10)) -eq 0 ]; then
+        echo "  ... waiting (${wait_count}s elapsed, shard0=$shard0_done, shard1=$shard1_done)"
+    fi
+done
+
+if [ $wait_count -ge $max_wait ]; then
+    echo "Warning: Benchmarks did not complete within ${max_wait}s timeout"
+fi
+
+# Graceful shutdown: SIGTERM first
+echo "Stopping shards (graceful)..."
+
+# First, kill the parent bash scripts to prevent them from respawning dbtest
+pkill -TERM -f "bash/shard.sh" 2>/dev/null || true
+
+# Send SIGTERM to all dbtest processes
+pkill -TERM dbtest 2>/dev/null || true
+sleep 3
+
+# Force kill any remaining processes
+echo "Force killing remaining processes..."
+pkill -9 -f "bash/shard.sh" 2>/dev/null || true
+pkill -9 dbtest 2>/dev/null || true
+killall -9 dbtest 2>/dev/null || true
+
+# Wait for OS to clean up
+sleep 2
+
+# Check for and kill any remaining processes including zombies
+remaining=$(ps aux | grep "dbtest" | grep -v grep | wc -l)
+if [ "$remaining" -gt 0 ]; then
+    echo "WARNING: $remaining dbtest processes still present after kill attempt"
+    ps aux | grep "dbtest" | grep -v grep
+
+    # Get PIDs and kill individually
+    pids=$(ps aux | grep "dbtest" | grep -v grep | awk '{print $2}')
+    for pid in $pids; do
+        echo "Force killing PID $pid"
+        kill -9 $pid 2>/dev/null || true
+    done
+
+    sleep 1
+fi
+
+# Final verification - reap zombie processes by explicitly waiting on child PIDs
+for pid in $SHARD0_PID $SHARD1_PID; do
+    wait $pid 2>/dev/null || true
+done
 
 echo ""
 echo "========================================="

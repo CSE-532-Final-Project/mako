@@ -77,5 +77,7 @@ if [ "$use_gdb" == "1" ]; then
     echo "GDB log will be saved to: ${GDB_LOG_DIR}/${GDB_LOG_NAME}"
     gdb -batch -x "${GDB_CMD_FILE}" --args $CMD
 else
-    eval $CMD
-fi 
+    # Use exec to replace this shell with dbtest, so the PID directly refers to dbtest.
+    # This ensures that signals sent to this script's PID reach dbtest properly.
+    exec $CMD
+fi

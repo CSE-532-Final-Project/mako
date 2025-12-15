@@ -50,14 +50,43 @@ nohup $CMD > $log_file 2>&1 &
 PROCESS_PID=$!
 sleep 2
 
-# Wait for experiments to run
-echo "Running experiments for 30 seconds..."
-sleep 50
+# Wait for benchmark to complete (poll for completion marker)
+echo "Waiting for benchmark to complete..."
+max_wait=120  # Maximum wait time in seconds
+wait_count=0
 
-# Kill the process
-echo "Stopping process..."
-kill $PROCESS_PID 2>/dev/null
-wait $PROCESS_PID 2>/dev/null
+while [ $wait_count -lt $max_wait ]; do
+    # Check if throughput output appeared (indicates completion)
+    if [ -f "$log_file" ] && grep -q "agg_persist_throughput" "$log_file" 2>/dev/null; then
+        echo "Benchmark completed after ${wait_count}s"
+        sleep 2  # Give a moment for final output
+        break
+    fi
+    sleep 1
+    wait_count=$((wait_count + 1))
+    if [ $((wait_count % 10)) -eq 0 ]; then
+        echo "  ... waiting (${wait_count}s elapsed)"
+    fi
+done
+
+if [ $wait_count -ge $max_wait ]; then
+    echo "Warning: Benchmark did not complete within ${max_wait}s timeout"
+fi
+
+# Graceful shutdown: SIGTERM first
+echo "Stopping process (graceful)..."
+kill -TERM $PROCESS_PID 2>/dev/null || true
+sleep 2
+
+# Force kill if still running
+if kill -0 $PROCESS_PID 2>/dev/null; then
+    echo "Force killing remaining process..."
+    kill -9 $PROCESS_PID 2>/dev/null || true
+fi
+
+# Clean up any orphaned dbtest processes
+pkill -9 dbtest 2>/dev/null || true
+wait $PROCESS_PID 2>/dev/null || true
 
 echo ""
 echo "========================================="
