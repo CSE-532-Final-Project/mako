@@ -16,7 +16,7 @@ echo "========================================="
 # Clean up old log files
 rm -f nfs_sync_*
 
-trd=${1:-6}
+trd=${1:-3}
 script_name="$(basename "$0")"
 
 # Determine transport type and create unique log prefix

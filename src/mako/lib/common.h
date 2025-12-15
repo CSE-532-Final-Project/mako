@@ -178,6 +178,11 @@ namespace mako
     // reserved for watermark exchange between follower data center
     const uint8_t watermarkReqType = 13;
     
+    // Early Lock Release (ELR) request types
+    const uint8_t earlyReleaseReqType = 14;
+    const uint8_t cascadeAbortReqType = 15;
+    const uint8_t elrDependencyReqType = 16;
+    
 
     const size_t max_key_length = 64;
 #if defined(MEGA_BENCHMARK)
@@ -506,6 +511,146 @@ namespace mako
         }
         return strtoul(x.c_str(), nullptr, 10) * mult;
     }
+
+    // =========================================================================
+    // Early Lock Release (ELR) Request/Response Structures
+    // =========================================================================
+
+    /**
+     * @brief Request to early-release locks held by a transaction
+     */
+    struct early_release_request_t {
+        uint16_t target_server_id;
+        uint32_t req_nr;
+        uint64_t txn_id;           // Transaction ID requesting early release
+        uint16_t num_keys;         // Number of keys to early release
+        // Followed by: [table_id (2), key_len (2), key_data (var)] * num_keys
+        char data[max_batch_size * (sizeof(uint16_t) * 2 + max_key_length)];
+    };
+
+    /**
+     * @brief Response to early release request
+     */
+    struct early_release_response_t {
+        uint32_t req_nr;
+        int status;
+        uint16_t num_released;     // Number of keys successfully released
+    };
+
+    /**
+     * @brief Request to cascade abort a transaction
+     */
+    struct cascade_abort_request_t {
+        uint16_t target_server_id;
+        uint32_t req_nr;
+        uint64_t txn_id;           // Transaction to abort
+        uint64_t cause_txn_id;     // Transaction that caused the cascade
+        uint32_t source_shard;     // Shard that initiated the cascade
+        uint64_t cascade_id;       // Unique ID for this cascade operation
+    };
+
+    /**
+     * @brief Response to cascade abort request
+     */
+    struct cascade_abort_response_t {
+        uint32_t req_nr;
+        int status;
+        uint16_t num_cascaded;     // Number of additional txns that were cascaded
+    };
+
+    /**
+     * @brief Request to register an ELR dependency
+     */
+    struct elr_dependency_request_t {
+        uint16_t target_server_id;
+        uint32_t req_nr;
+        uint64_t reader_txn_id;    // Transaction that is reading
+        uint64_t writer_txn_id;    // Transaction that early-released
+        uint16_t table_id;
+        uint16_t key_len;
+        char key[max_key_length];
+    };
+
+    /**
+     * @brief Response to dependency registration
+     */
+    struct elr_dependency_response_t {
+        uint32_t req_nr;
+        int status;
+        bool cycle_detected;       // True if adding this would create a cycle
+    };
+
+    /**
+     * @brief ELR-specific error codes
+     */
+    class ELRErrorCode {
+    public:
+        static const int ELR_SUCCESS = 0;
+        static const int ELR_NOT_ENABLED = 1;
+        static const int ELR_TXN_NOT_FOUND = 2;
+        static const int ELR_ALREADY_RELEASED = 3;
+        static const int ELR_CHAIN_TOO_DEEP = 4;
+        static const int ELR_CYCLE_DETECTED = 5;
+        static const int ELR_CASCADE_FAILED = 6;
+        static const int ELR_TIMEOUT = 7;
+    };
+
+    /**
+     * @brief Wrapper for building early release requests
+     */
+    class EarlyReleaseRequestWrapper {
+    public:
+        EarlyReleaseRequestWrapper(uint64_t txn_id, uint16_t server_id) {
+            request_ = new early_release_request_t;
+            request_->txn_id = txn_id;
+            request_->target_server_id = server_id;
+            request_->num_keys = 0;
+            data_ptr_ = request_->data;
+            msg_len_ = 0;
+        }
+
+        ~EarlyReleaseRequestWrapper() {
+            delete request_;
+        }
+
+        void add_key(uint16_t table_id, const std::string& key) {
+            uint16_t key_len = static_cast<uint16_t>(key.size());
+            
+            // Write table_id
+            memcpy(data_ptr_, &table_id, sizeof(uint16_t));
+            data_ptr_ += sizeof(uint16_t);
+            msg_len_ += sizeof(uint16_t);
+            
+            // Write key_len
+            memcpy(data_ptr_, &key_len, sizeof(uint16_t));
+            data_ptr_ += sizeof(uint16_t);
+            msg_len_ += sizeof(uint16_t);
+            
+            // Write key data
+            memcpy(data_ptr_, key.c_str(), key_len);
+            data_ptr_ += key_len;
+            msg_len_ += key_len;
+            
+            request_->num_keys++;
+        }
+
+        void set_req_nr(uint32_t req_nr) {
+            request_->req_nr = req_nr;
+        }
+
+        size_t get_msg_len() const {
+            return offsetof(early_release_request_t, data) + msg_len_;
+        }
+
+        early_release_request_t* get_request() {
+            return request_;
+        }
+
+    private:
+        early_release_request_t* request_;
+        char* data_ptr_;
+        size_t msg_len_;
+    };
 }
 
 #endif

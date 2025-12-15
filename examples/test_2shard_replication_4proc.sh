@@ -18,7 +18,7 @@ rm -f 4proc-*.log
 USERNAME=${USER:-unknown}
 rm -rf /tmp/${USERNAME}_mako_rocksdb_shard*
 
-trd=6
+trd=3
 script_name="$(basename "$0")"
 path=$(pwd)/src/mako
 

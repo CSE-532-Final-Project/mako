@@ -549,6 +549,20 @@ set(MAKO_SRCFILES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/benchmarks/abstract_db.cc"
 )
 
+# Early Lock Release (ELR) source files - conditionally included
+option(ENABLE_ELR "Enable Early Lock Release for reduced contention" OFF)
+if(ENABLE_ELR)
+  list(APPEND MAKO_SRCFILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_manager.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/dependency_tracker.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/cascade_abort.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_log.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/elr/elr_integration.cc"
+  )
+  add_compile_definitions(ENABLE_ELR)
+  message(STATUS "Early Lock Release (ELR) enabled")
+endif()
+
 # Benchmark flags
 set(BENCH_CXXFLAGS ${CXXFLAGS})
 set(BENCH_LDFLAGS
@@ -1431,6 +1445,31 @@ if(BUILD_TESTS)
         ${GTEST_INCLUDE_DIRS}
     )
     add_test(NAME STOTransactionRealTests COMMAND test_sto_transaction_real)
+
+    # =========================================================================
+    # Early Lock Release (ELR) Tests
+    # =========================================================================
+    # ELR tests use a custom test framework (not GoogleTest)
+    # They compile the ELR source files directly with ENABLE_ELR defined
+    add_executable(test_elr 
+        test/test_elr.cc
+        src/mako/elr/elr_manager.cc
+        src/mako/elr/dependency_tracker.cc
+        src/mako/elr/cascade_abort.cc
+        src/mako/elr/elr_log.cc
+        src/mako/elr/elr_integration.cc
+    )
+    target_compile_definitions(test_elr PRIVATE ENABLE_ELR)
+    target_include_directories(test_elr PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/mako
+        ${CMAKE_SOURCE_DIR}/src/mako/elr
+    )
+    target_compile_options(test_elr PRIVATE ${TEST_COMPILE_OPTIONS})
+    target_link_libraries(test_elr pthread)
+    add_test(NAME ELRTests COMMAND test_elr)
+    message(STATUS "    - test_elr: Early Lock Release (ELR) tests")
 
     # Custom target to run all SILO/STO tests
     add_custom_target(run_silo_sto_tests

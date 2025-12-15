@@ -12,16 +12,18 @@ rm -f simple-shard0*.log nfs_sync_*
 USERNAME=${USER:-unknown}
 rm -rf /tmp/${USERNAME}_mako_rocksdb_shard*
 
+trd=${1:-3}
+
 # Start shard 0 in background - capture ALL PIDs
 echo "Starting shard 0..."
-nohup ./build/simpleTransactionRep 1 0 6 localhost 1 > simple-shard0-localhost.log 2>&1 &
+nohup ./build/simpleTransactionRep 1 0 $trd localhost 1 > simple-shard0-localhost.log 2>&1 &
 PID_LOCALHOST=$!
-nohup ./build/simpleTransactionRep 1 0 6 learner 1 > simple-shard0-learner.log 2>&1 &
+nohup ./build/simpleTransactionRep 1 0 $trd learner 1 > simple-shard0-learner.log 2>&1 &
 PID_LEARNER=$!
-nohup ./build/simpleTransactionRep 1 0 6 p2 1 > simple-shard0-p2.log 2>&1 &
+nohup ./build/simpleTransactionRep 1 0 $trd p2 1 > simple-shard0-p2.log 2>&1 &
 PID_P2=$!
 sleep 1
-nohup ./build/simpleTransactionRep 1 0 6 p1 1  > simple-shard0-p1.log 2>&1 &
+nohup ./build/simpleTransactionRep 1 0 $trd p1 1  > simple-shard0-p1.log 2>&1 &
 PID_P1=$!
 sleep 2
 

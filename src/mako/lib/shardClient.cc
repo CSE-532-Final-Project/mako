@@ -512,4 +512,69 @@ namespace mako
                             ABORT_TIMEOUT);
         return is_all_response_ok();
     }
+
+    // =========================================================================
+    // Early Lock Release (ELR) Methods
+    // =========================================================================
+
+    int ShardClient::remoteEarlyRelease(uint64_t txn_id,
+                                        const std::vector<std::pair<uint16_t, std::string>>& keys)
+    {
+        int shards_to_send_bits = TThread::writeset_shard_bits;
+        if (!shards_to_send_bits) return ErrorCode::SUCCESS;
+        calculate_num_response_waiting(shards_to_send_bits);
+        uint16_t server_id = shardIndex * config.warehouses + par_id;
+
+        client->InvokeEarlyRelease(++tid,  // txn_nr
+                                   txn_id,
+                                   shards_to_send_bits,
+                                   server_id,
+                                   keys,
+                                   bind(&ShardClient::SendToAllStatusCallBack, this, placeholders::_1),
+                                   bind(&ShardClient::SendToAllGiveUpTimeout, this),
+                                   BASIC_TIMEOUT);
+        return is_all_response_ok();
+    }
+
+    int ShardClient::remoteCascadeAbort(uint64_t txn_id, uint64_t cause_txn_id,
+                                        uint32_t source_shard, uint64_t cascade_id)
+    {
+        int shards_to_send_bits = TThread::writeset_shard_bits | TThread::readset_shard_bits;
+        if (!shards_to_send_bits) return ErrorCode::SUCCESS;
+        calculate_num_response_waiting(shards_to_send_bits);
+        uint16_t server_id = shardIndex * config.warehouses + par_id;
+
+        client->InvokeCascadeAbort(++tid,  // txn_nr
+                                   txn_id,
+                                   cause_txn_id,
+                                   shards_to_send_bits,
+                                   server_id,
+                                   source_shard,
+                                   cascade_id,
+                                   bind(&ShardClient::SendToAllStatusCallBack, this, placeholders::_1),
+                                   bind(&ShardClient::SendToAllGiveUpTimeout, this),
+                                   BASIC_TIMEOUT);
+        return is_all_response_ok();
+    }
+
+    int ShardClient::remoteRegisterELRDependency(uint64_t reader_txn_id, uint64_t writer_txn_id,
+                                                  uint16_t table_id, const std::string& key)
+    {
+        int shards_to_send_bits = TThread::writeset_shard_bits;
+        if (!shards_to_send_bits) return ErrorCode::SUCCESS;
+        calculate_num_response_waiting(shards_to_send_bits);
+        uint16_t server_id = shardIndex * config.warehouses + par_id;
+
+        client->InvokeELRDependency(++tid,  // txn_nr
+                                    reader_txn_id,
+                                    writer_txn_id,
+                                    shards_to_send_bits,
+                                    server_id,
+                                    table_id,
+                                    key,
+                                    bind(&ShardClient::SendToAllStatusCallBack, this, placeholders::_1),
+                                    bind(&ShardClient::SendToAllGiveUpTimeout, this),
+                                    BASIC_TIMEOUT);
+        return is_all_response_ok();
+    }
 }

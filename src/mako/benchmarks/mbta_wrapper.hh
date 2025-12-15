@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include "abstract_db.h"
 #include "abstract_ordered_index.h"
+
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "../elr/elr_manager.h"
+#include "../elr/elr_common.h"
+#endif
 #include "sto/Transaction.hh"
 #include "sto/MassTrans.hh"
 #include "sto/Hashtable.hh"
@@ -1186,6 +1192,128 @@ public:
   void shard_abort_txn(void *txn) {
     Sto::silent_abort();
   }
+
+  // =========================================================================
+  // Early Lock Release (ELR) Implementation
+  // =========================================================================
+
+#ifdef ENABLE_ELR
+  bool shard_early_release(void *txn, uint64_t txn_id) override {
+    using namespace mako::elr;
+    
+    // Check if ELR is enabled
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    // Check if early release is allowed
+    if (!elr_manager.canEarlyRelease(txn_id)) {
+      return false;
+    }
+    
+    // Note: The actual early release logic is handled in txn_impl.h
+    // during the commit process after validation passes.
+    // This method is called from the server-side RPC handler.
+    
+    // For server-side early release requests, we just mark the intention
+    // The actual lock release happens in the transaction commit path
+    std::vector<ELRKey> keys;
+    // Keys would be passed from the RPC request
+    
+    auto result = elr_manager.earlyRelease(txn_id, keys);
+    return result.success;
+  }
+
+  int shard_cascade_abort(uint64_t txn_id, uint64_t cause_txn_id) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return 0;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    // Abort the transaction and get cascade set
+    auto result = elr_manager.abortTransaction(txn_id);
+    
+    // Also abort locally via Sto
+    Sto::silent_abort();
+    
+    return static_cast<int>(result.aborted_txns.size());
+  }
+
+  bool shard_register_elr_dependency(uint64_t reader_txn_id,
+                                      uint64_t writer_txn_id,
+                                      uint16_t table_id,
+                                      const std::string& key) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    
+    ELRKey elr_key;
+    elr_key.shard_id = TThread::get_shard_index();
+    elr_key.table_id = table_id;
+    elr_key.key = key;
+    
+    return elr_manager.registerELRRead(reader_txn_id, writer_txn_id, elr_key, 0);
+  }
+
+  bool can_early_release(void *txn) override {
+    using namespace mako::elr;
+    
+    if (!elr_enabled()) {
+      return false;
+    }
+    
+    // Check with ELR manager using transaction pointer as ID
+    auto& elr_manager = ELRManager::getInstance(TThread::get_shard_index());
+    uint64_t txn_id = reinterpret_cast<uint64_t>(txn);
+    return elr_manager.canEarlyRelease(txn_id);
+  }
+
+  bool is_elr_enabled() const override {
+    return mako::elr::elr_enabled();
+  }
+#else
+  // Stub implementations when ELR is disabled
+  bool shard_early_release(void *txn, uint64_t txn_id) override {
+    (void)txn;
+    (void)txn_id;
+    return false;
+  }
+
+  int shard_cascade_abort(uint64_t txn_id, uint64_t cause_txn_id) override {
+    (void)txn_id;
+    (void)cause_txn_id;
+    return 0;
+  }
+
+  bool shard_register_elr_dependency(uint64_t reader_txn_id,
+                                      uint64_t writer_txn_id,
+                                      uint16_t table_id,
+                                      const std::string& key) override {
+    (void)reader_txn_id;
+    (void)writer_txn_id;
+    (void)table_id;
+    (void)key;
+    return false;
+  }
+
+  bool can_early_release(void *txn) override {
+    (void)txn;
+    return false;
+  }
+
+  bool is_elr_enabled() const override {
+    return false;
+  }
+#endif // ENABLE_ELR
 
   abstract_ordered_index *
   open_index(const std::string &name,

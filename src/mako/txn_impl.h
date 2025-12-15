@@ -4,6 +4,12 @@
 #include "txn.h"
 #include "lockguard.h"
 
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "elr/elr_integration.h"
+#include "benchmarks/sto/Interface.hh"
+#endif
+
 // base definitions
 
 template <template <typename> class Protocol, typename Traits>
@@ -13,6 +19,22 @@ transaction<Protocol, Traits>::transaction(uint64_t flags, string_allocator_type
   INVARIANT(rcu::s_instance.in_rcu_region());
 #ifdef BTREE_LOCK_OWNERSHIP_CHECKING
   concurrent_btree::NodeLockRegionBegin();
+#endif
+
+#ifdef ENABLE_ELR
+  // Initialize ELR state for this transaction
+  // Generate unique transaction ID using thread ID and counter
+  static thread_local uint64_t txn_counter = 0;
+  elr_txn_id_ = (static_cast<uint64_t>(TThread::id()) << 32) | (++txn_counter);
+  elr_shard_id_ = static_cast<mako::elr::shardid_t>(TThread::get_shard_index());
+  elr_released_ = false;
+  elr_can_abort_ = true;
+  elr_dependencies_.clear();
+  
+  // Register transaction with ELR manager
+  if (mako::elr::elr_enabled()) {
+    mako::elr::ELRIntegration::getInstance().onTransactionBegin(elr_shard_id_, elr_txn_id_);
+  }
 #endif
 }
 
@@ -60,6 +82,14 @@ transaction<Protocol, Traits>::abort_impl(abort_reason reason)
   }
   state = TXN_ABRT;
   this->reason = reason;
+
+#ifdef ENABLE_ELR
+  // If this transaction has early-released locks, trigger cascade abort
+  if (elr_released_ && elr_txn_id_ != 0) {
+    auto& elr_integration = mako::elr::ELRIntegration::getInstance();
+    elr_integration.onAbort(elr_shard_id_, elr_txn_id_);
+  }
+#endif
 
   // on abort, we need to go over all insert nodes and
   // release the locks
@@ -383,6 +413,56 @@ transaction<Protocol, Traits>::commit(bool doThrow)
       }
     }
 
+#ifdef ENABLE_ELR
+    // =========================================================================
+    // ELR Safe Point: Validation has passed, we can now early-release locks
+    // =========================================================================
+    // At this point:
+    // - All write locks are held
+    // - Read validation has passed
+    // - We are committed to finishing this transaction
+    //
+    // Early releasing here allows other transactions to read our uncommitted
+    // (but validated) writes, improving concurrency in geo-replicated settings.
+    
+    if (mako::elr::elr_enabled() && !write_dbtuples.empty() && can_early_release()) {
+      // Notify ELR integration that validation passed
+      auto& elr_integration = mako::elr::ELRIntegration::getInstance();
+      elr_integration.onPostValidate(elr_shard_id_, elr_txn_id_);
+      
+      // Build list of keys to early-release
+      std::vector<mako::elr::ELRKey> elr_keys;
+      typename write_set_map::iterator wit = write_set.begin();
+      typename write_set_map::iterator wit_end = write_set.end();
+      for (; wit != wit_end; ++wit) {
+        if (!wit->do_write()) continue;
+        
+        mako::elr::ELRKey key;
+        key.shard_id = elr_shard_id_;
+        key.table_id = 0; // TODO: get actual table_id from btree
+        key.key = wit->get_key();
+        elr_keys.push_back(key);
+      }
+      
+      // Perform early lock release
+      if (!elr_keys.empty()) {
+        bool released = elr_integration.earlyReleaseLocks(
+            elr_shard_id_, elr_txn_id_, elr_keys);
+        if (released) {
+          elr_released_ = true;
+          
+          // Mark tuples as early-released (for dependency tracking)
+          for (typename dbtuple_write_info_vec::iterator dit = write_dbtuples.begin();
+               dit != write_dbtuples.end(); ++dit) {
+            if (dit->is_locked()) {
+              dit->tuple->mark_early_released(elr_txn_id_);
+            }
+          }
+        }
+      }
+    }
+#endif // ENABLE_ELR
+
     // commit actual records
     if (!write_dbtuples.empty()) {
       PERF_DECL(
@@ -451,6 +531,15 @@ transaction<Protocol, Traits>::commit(bool doThrow)
     }
   }
   state = TXN_COMMITED;
+
+#ifdef ENABLE_ELR
+  // Notify ELR that this transaction has committed
+  if (elr_txn_id_ != 0) {
+    auto& elr_integration = mako::elr::ELRIntegration::getInstance();
+    elr_integration.onCommit(elr_shard_id_, elr_txn_id_);
+  }
+#endif
+
   if (commit_tid.first)
     cast()->on_tid_finish(commit_tid.second);
   clear();
@@ -462,6 +551,14 @@ do_abort:
     VERBOSE(std::cerr << "aborting txn @ snapshot_tid " << cast()->snapshot_tid() << std::endl);
   else
     VERBOSE(std::cerr << "aborting txn" << std::endl);
+
+#ifdef ENABLE_ELR
+  // If this transaction has early-released locks, trigger cascade abort
+  if (elr_released_ && elr_txn_id_ != 0) {
+    auto& elr_integration = mako::elr::ELRIntegration::getInstance();
+    elr_integration.onAbort(elr_shard_id_, elr_txn_id_);
+  }
+#endif
 
   for (typename dbtuple_write_info_vec::iterator it = write_dbtuples.begin();
        it != write_dbtuples.end(); ++it) {
@@ -618,6 +715,42 @@ transaction<Protocol, Traits>::do_tuple_read(
     // read-only txns do not need read-set tracking
     // (b/c we know the values are consistent)
     read_set.emplace_back(tuple, start_t);
+
+#ifdef ENABLE_ELR
+  // Check if we read from an early-released tuple and register dependency
+  if (!v_empty && mako::elr::elr_enabled()) {
+    mako::elr::txnid_t writer_txn = tuple->check_elr_dependency();
+    if (writer_txn != 0 && writer_txn != elr_txn_id_) {
+      // We read from an uncommitted but early-released write
+      // Register the dependency: this transaction depends on writer_txn
+      auto& elr_integration = mako::elr::ELRIntegration::getInstance();
+      
+      mako::elr::ELRKey key;
+      key.shard_id = elr_shard_id_;
+      key.table_id = 0; // TODO: get actual table_id
+      // key.key would need to be passed in or stored in tuple
+      
+      bool registered = elr_integration.registerDependency(
+          elr_shard_id_, elr_txn_id_, writer_txn, key);
+      
+      if (registered) {
+        // Track this dependency locally
+        add_elr_dependency(writer_txn);
+        
+        // Increment dependent count on the tuple
+        const_cast<dbtuple*>(tuple)->add_elr_dependent();
+      } else {
+        // Cycle detected - we cannot proceed with this read
+        // Must abort to prevent deadlock
+        const transaction_base::abort_reason r = 
+            transaction_base::ABORT_REASON_ELR_DEPENDENCY_CYCLE;
+        abort_impl(r);
+        throw transaction_abort_exception(r);
+      }
+    }
+  }
+#endif // ENABLE_ELR
+
   return !v_empty;
 }
 

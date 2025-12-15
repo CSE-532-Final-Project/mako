@@ -133,6 +133,42 @@ namespace mako
                             error_continuation_t error_continuation,
                             uint32_t timeout); 
 
+        // Early Lock Release (ELR) methods
+        void InvokeEarlyRelease(uint64_t txn_nr,
+                            uint64_t txn_id,
+                            int dstShardIdx,
+                            uint16_t server_id,
+                            const std::vector<std::pair<uint16_t, std::string>>& keys,
+                            resp_continuation_t continuation,
+                            error_continuation_t error_continuation,
+                            uint32_t timeout);
+
+        void InvokeCascadeAbort(uint64_t txn_nr,
+                            uint64_t txn_id,
+                            uint64_t cause_txn_id,
+                            int dstShardIdx,
+                            uint16_t server_id,
+                            uint32_t source_shard,
+                            uint64_t cascade_id,
+                            resp_continuation_t continuation,
+                            error_continuation_t error_continuation,
+                            uint32_t timeout);
+
+        void InvokeELRDependency(uint64_t txn_nr,
+                            uint64_t reader_txn_id,
+                            uint64_t writer_txn_id,
+                            int dstShardIdx,
+                            uint16_t server_id,
+                            uint16_t table_id,
+                            const std::string& key,
+                            resp_continuation_t continuation,
+                            error_continuation_t error_continuation,
+                            uint32_t timeout);
+
+        void HandleEarlyReleaseReply(char *respBuf);
+        void HandleCascadeAbortReply(char *respBuf);
+        void HandleELRDependencyReply(char *respBuf);
+
         void HandleGetReply(char *respBuf);
         void HandleScanReply(char *respBuf);
         void HandleLockReply(char *respBuf);

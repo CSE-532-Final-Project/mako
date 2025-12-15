@@ -36,6 +36,12 @@
 #include "scopedperf.hh"
 #include "marked_ptr.h"
 
+// Early Lock Release support
+#ifdef ENABLE_ELR
+#include "elr/elr_common.h"
+#include "elr/elr_manager.h"
+#endif
+
 // forward decl
 template <template <typename> class Transaction, typename P>
   class base_txn_btree;
@@ -83,7 +89,9 @@ public:
     x(ABORT_REASON_WRITE_NODE_INTERFERENCE) \
     x(ABORT_REASON_INSERT_NODE_INTERFERENCE) \
     x(ABORT_REASON_READ_NODE_INTEREFERENCE) \
-    x(ABORT_REASON_READ_ABSENCE_INTEREFERENCE)
+    x(ABORT_REASON_READ_ABSENCE_INTEREFERENCE) \
+    x(ABORT_REASON_CASCADE_ABORT) \
+    x(ABORT_REASON_ELR_DEPENDENCY_CYCLE)
 
   enum abort_reason {
 #define ENUM_X(x) x,
@@ -349,6 +357,100 @@ protected:
   txn_state state;
   abort_reason reason;
   const uint64_t flags;
+
+#ifdef ENABLE_ELR
+  // Early Lock Release state
+  
+  // Whether this transaction has early-released any locks
+  bool elr_released_ = false;
+  
+  // Transaction ID for ELR tracking (assigned lazily)
+  mako::elr::txnid_t elr_txn_id_ = 0;
+  
+  // Transactions we depend on (we read their uncommitted writes)
+  std::vector<mako::elr::txnid_t> elr_dependencies_;
+  
+  // Whether we can abort (not yet passed point of no return)
+  bool elr_can_abort_ = true;
+  
+  // Shard ID for this transaction
+  mako::elr::shardid_t elr_shard_id_ = 0;
+  
+  /**
+   * @brief Set the ELR transaction ID
+   */
+  void set_elr_txn_id(mako::elr::txnid_t id) { elr_txn_id_ = id; }
+  
+  /**
+   * @brief Get the ELR transaction ID
+   */
+  mako::elr::txnid_t get_elr_txn_id() const { return elr_txn_id_; }
+  
+  /**
+   * @brief Check if this transaction has early-released any locks
+   */
+  bool has_early_released() const { return elr_released_; }
+  
+  /**
+   * @brief Add a dependency on another transaction
+   */
+  void add_elr_dependency(mako::elr::txnid_t dep_txn_id) {
+    elr_dependencies_.push_back(dep_txn_id);
+  }
+  
+  /**
+   * @brief Get all ELR dependencies
+   */
+  const std::vector<mako::elr::txnid_t>& get_elr_dependencies() const {
+    return elr_dependencies_;
+  }
+  
+  /**
+   * @brief Check if this transaction can safely perform early lock release
+   *
+   * Conditions for safe ELR:
+   * 1. ELR is globally enabled
+   * 2. Transaction is in ACTIVE state
+   * 3. Not a read-only transaction
+   * 4. Dependency chain is not too deep
+   */
+  bool can_early_release() const {
+    if (!mako::elr::elr_enabled()) return false;
+    if (state != TXN_ACTIVE) return false;
+    if (flags & TXN_FLAG_READ_ONLY) return false;
+    
+    // Check with ELR manager if chain depth is acceptable
+    auto& manager = mako::elr::ELRManager::getInstance(elr_shard_id_);
+    return manager.canEarlyRelease(elr_txn_id_);
+  }
+  
+  /**
+   * @brief Mark that this transaction has early-released locks
+   */
+  void mark_early_released() { elr_released_ = true; }
+  
+  /**
+   * @brief Check if this transaction can commit (all dependencies resolved)
+   */
+  bool elr_can_commit() const {
+    if (!elr_released_) return true; // No ELR, can always commit
+    
+    auto& manager = mako::elr::ELRManager::getInstance(elr_shard_id_);
+    return manager.canCommit(elr_txn_id_);
+  }
+  
+  /**
+   * @brief Wait for all ELR dependencies to commit
+   * @param timeout_ms Timeout in milliseconds
+   * @return true if all dependencies committed, false on timeout
+   */
+  bool wait_for_elr_dependencies(uint32_t timeout_ms = 1000) {
+    if (elr_dependencies_.empty()) return true;
+    
+    auto& manager = mako::elr::ELRManager::getInstance(elr_shard_id_);
+    return manager.waitForDependencies(elr_txn_id_, timeout_ms);
+  }
+#endif // ENABLE_ELR
 };
 
 // @trusted: uses function pointer call g_proto_version_str
